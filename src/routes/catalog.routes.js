@@ -26,6 +26,8 @@ router.delete('/recipes/:id', verifyToken, requireAdmin, catalogController.delet
 // Mesas
 router.get('/tables', verifyToken, catalogController.getTables);
 router.post('/tables', verifyToken, requireAdmin, catalogController.upsertTable);
+router.patch('/tables/:id/status', verifyToken, catalogController.updateTableStatus);
+router.get('/tables/:id/current-order', verifyToken, catalogController.getCurrentOrder);
 router.delete('/tables/:id', verifyToken, requireAdmin, catalogController.deleteTable);
 
 module.exports = router;

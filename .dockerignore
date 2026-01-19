@@ -1,0 +1,37 @@
+# Dependencies
+node_modules
+npm-debug.log
+
+# Environment files (se pasan como variables de Docker)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs
+*.log
+
+# Test files
+tests
+__tests__
+coverage
+*.test.js
+*.spec.js
+
+# Documentation
+*.md
+docs
+
+# Git
+.git
+.gitignore

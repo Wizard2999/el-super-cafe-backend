@@ -1,4 +1,5 @@
 const { query } = require('../config/database');
+const socketEvents = require('../services/socketEvents');
 
 // ============================================
 // CATEGORÍAS
@@ -362,6 +363,11 @@ async function upsertTable(req, res) {
       });
     }
 
+    // Obtener estado anterior para comparar
+    const existing = await query('SELECT status FROM cafe_tables WHERE id = ?', [id]);
+    const previousStatus = existing.length > 0 ? existing[0].status : null;
+    const newStatus = status || 'free';
+
     await query(
       `INSERT INTO cafe_tables (id, name, status, is_synced)
        VALUES (?, ?, ?, 1)
@@ -370,8 +376,25 @@ async function upsertTable(req, res) {
          status = VALUES(status),
          is_synced = 1,
          updated_at = CURRENT_TIMESTAMP`,
-      [id, name, status || 'free']
+      [id, name, newStatus]
     );
+
+    // Emitir evento de socket si el estado cambió
+    if (previousStatus !== newStatus) {
+      socketEvents.emitTableStatusChange({
+        tableId: id,
+        tableName: name,
+        status: newStatus,
+      });
+    }
+
+    // Emitir actualización de catálogo
+    socketEvents.emitCatalogUpdate({
+      type: 'table',
+      action: previousStatus ? 'update' : 'create',
+      id,
+      data: { id, name, status: newStatus },
+    });
 
     res.json({
       success: true,
@@ -382,6 +405,138 @@ async function upsertTable(req, res) {
     res.status(500).json({
       success: false,
       error: 'Error guardando mesa',
+    });
+  }
+}
+
+/**
+ * PATCH /api/catalog/tables/:id/status
+ * Cambiar solo el estado de una mesa
+ */
+async function updateTableStatus(req, res) {
+  try {
+    const { id } = req.params;
+    const { status, currentSaleId } = req.body;
+
+    if (!status || !['free', 'occupied'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requiere status válido (free | occupied)',
+      });
+    }
+
+    // Obtener información actual de la mesa
+    const existing = await query('SELECT id, name, status FROM cafe_tables WHERE id = ?', [id]);
+
+    if (existing.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Mesa no encontrada',
+      });
+    }
+
+    const table = existing[0];
+
+    // Actualizar estado
+    await query(
+      `UPDATE cafe_tables
+       SET status = ?, is_synced = 1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [status, id]
+    );
+
+    // Emitir evento de cambio de estado
+    socketEvents.emitTableStatusChange({
+      tableId: id,
+      tableName: table.name,
+      status,
+      currentSaleId,
+    });
+
+    res.json({
+      success: true,
+      message: `Mesa ${table.name} ahora está ${status === 'free' ? 'disponible' : 'ocupada'}`,
+      data: { id, name: table.name, status },
+    });
+  } catch (error) {
+    console.error('Error actualizando estado de mesa:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error actualizando estado de mesa',
+    });
+  }
+}
+
+/**
+ * GET /api/catalog/tables/:id/current-order
+ * Obtener el pedido actual de una mesa ocupada
+ */
+async function getCurrentOrder(req, res) {
+  try {
+    const { id } = req.params;
+
+    // Verificar que la mesa existe y está ocupada
+    const table = await query('SELECT id, name, status FROM cafe_tables WHERE id = ?', [id]);
+
+    if (table.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Mesa no encontrada',
+      });
+    }
+
+    if (table[0].status !== 'occupied') {
+      return res.json({
+        success: true,
+        data: null,
+        message: 'Mesa disponible, sin pedido activo',
+      });
+    }
+
+    // Buscar venta pendiente en esta mesa
+    const sale = await query(
+      `SELECT s.*,
+              JSON_ARRAYAGG(
+                JSON_OBJECT(
+                  'id', si.id,
+                  'product_id', si.product_id,
+                  'product_name', si.product_name,
+                  'quantity', si.quantity,
+                  'unit_price', si.unit_price
+                )
+              ) as items
+       FROM sales s
+       LEFT JOIN sale_items si ON s.id = si.sale_id
+       WHERE s.table_id = ? AND s.status = 'pending'
+       GROUP BY s.id
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
+      [id]
+    );
+
+    if (sale.length === 0) {
+      return res.json({
+        success: true,
+        data: null,
+        message: 'Mesa ocupada pero sin pedido pendiente encontrado',
+      });
+    }
+
+    // Parsear items del JSON
+    const order = sale[0];
+    order.items = order.items ? JSON.parse(order.items) : [];
+    // Filtrar items nulos (cuando no hay items)
+    order.items = order.items.filter(item => item.id !== null);
+
+    res.json({
+      success: true,
+      data: order,
+    });
+  } catch (error) {
+    console.error('Error obteniendo pedido actual:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error obteniendo pedido actual',
     });
   }
 }
@@ -592,6 +747,8 @@ module.exports = {
   // Mesas
   getTables,
   upsertTable,
+  updateTableStatus,
+  getCurrentOrder,
   deleteTable,
   // Catálogo completo
   getFullCatalog,

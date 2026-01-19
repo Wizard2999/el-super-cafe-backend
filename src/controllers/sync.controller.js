@@ -1,5 +1,6 @@
 const { query, transaction } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
+const socketEvents = require('../services/socketEvents');
 
 /**
  * POST /api/sync
@@ -132,8 +133,9 @@ async function syncShift(shift) {
  */
 async function syncSale(sale) {
   // Verificar si la venta ya existe
-  const existing = await query('SELECT id FROM sales WHERE id = ?', [sale.id]);
+  const existing = await query('SELECT id, status FROM sales WHERE id = ?', [sale.id]);
   const isNew = existing.length === 0;
+  const previousStatus = existing.length > 0 ? existing[0].status : null;
 
   const sql = `
     INSERT INTO sales (
@@ -164,6 +166,57 @@ async function syncSale(sale) {
     sale.print_count || 0,
     new Date(sale.created_at),
   ]);
+
+  // Emitir eventos de socket según el estado
+  if (sale.status === 'completed' && previousStatus !== 'completed') {
+    // Venta completada - emitir evento de venta y liberar mesa
+    socketEvents.emitSaleComplete({
+      saleId: sale.id,
+      tableId: sale.table_id,
+      total: sale.total,
+      paymentMethod: sale.payment_method,
+      status: sale.status,
+    });
+
+    // Si la venta tiene una mesa asociada, liberarla
+    if (sale.table_id) {
+      await query(
+        `UPDATE cafe_tables SET status = 'free', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [sale.table_id]
+      );
+      const tableInfo = await query('SELECT name FROM cafe_tables WHERE id = ?', [sale.table_id]);
+      socketEvents.emitTableStatusChange({
+        tableId: sale.table_id,
+        tableName: tableInfo[0]?.name || 'Mesa',
+        status: 'free',
+      });
+    }
+  } else if (sale.status === 'pending' && isNew && sale.table_id) {
+    // Nuevo pedido pendiente en mesa - ocupar mesa
+    await query(
+      `UPDATE cafe_tables SET status = 'occupied', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [sale.table_id]
+    );
+    const tableInfo = await query('SELECT name FROM cafe_tables WHERE id = ?', [sale.table_id]);
+    socketEvents.emitTableStatusChange({
+      tableId: sale.table_id,
+      tableName: tableInfo[0]?.name || 'Mesa',
+      status: 'occupied',
+      currentSaleId: sale.id,
+    });
+    socketEvents.emitOrderUpdate({
+      tableId: sale.table_id,
+      saleId: sale.id,
+      status: 'pending',
+    });
+  } else if (sale.status === 'pending' && !isNew) {
+    // Actualización de pedido existente
+    socketEvents.emitOrderUpdate({
+      tableId: sale.table_id,
+      saleId: sale.id,
+      status: 'pending',
+    });
+  }
 
   return isNew;
 }
@@ -264,6 +317,10 @@ async function processInventoryDeduction(saleId) {
  * Sincronizar un movimiento
  */
 async function syncMovement(movement) {
+  // Verificar si es nuevo
+  const existing = await query('SELECT id FROM movements WHERE id = ?', [movement.id]);
+  const isNew = existing.length === 0;
+
   const sql = `
     INSERT INTO movements (
       id, type, amount, description, shift_id, is_synced, created_at
@@ -283,6 +340,16 @@ async function syncMovement(movement) {
     movement.shift_id || null,
     new Date(movement.created_at),
   ]);
+
+  // Emitir evento si es nuevo
+  if (isNew) {
+    socketEvents.emitMovementCreate({
+      movementId: movement.id,
+      type: movement.type,
+      amount: movement.amount,
+      description: movement.description,
+    });
+  }
 }
 
 /**
