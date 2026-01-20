@@ -34,11 +34,16 @@ async function syncFromDevice(req, res) {
       }
     }
 
-    // Sincronizar ventas
+    // Sincronizar ventas y rastrear las que necesitan descuento de inventario
+    const salesNeedingInventoryDeduction = [];
     for (const sale of sales) {
       try {
-        await syncSale(sale);
+        const needsInventoryDeduction = await syncSale(sale);
         results.sales.synced++;
+        // Si necesita descuento de inventario, marcarla
+        if (needsInventoryDeduction) {
+          salesNeedingInventoryDeduction.push(sale.id);
+        }
       } catch (error) {
         results.sales.errors.push({
           id: sale.id,
@@ -55,6 +60,21 @@ async function syncFromDevice(req, res) {
       } catch (error) {
         results.sale_items.errors.push({
           id: item.id,
+          error: error.message,
+        });
+      }
+    }
+
+    // Procesar descuento de inventario para ventas que lo necesitan
+    // (después de que los items estén sincronizados)
+    for (const saleId of salesNeedingInventoryDeduction) {
+      try {
+        await processInventoryDeduction(saleId);
+        results.inventory.processed++;
+      } catch (error) {
+        console.error(`Error procesando inventario para venta ${saleId}:`, error);
+        results.inventory.errors.push({
+          saleId,
           error: error.message,
         });
       }
@@ -95,6 +115,11 @@ async function syncFromDevice(req, res) {
  * Sincronizar un turno
  */
 async function syncShift(shift) {
+  // Verificar si es un turno nuevo o actualización
+  const existing = await query('SELECT id, status FROM shifts WHERE id = ?', [shift.id]);
+  const isNew = existing.length === 0;
+  const previousStatus = existing.length > 0 ? existing[0].status : null;
+
   const sql = `
     INSERT INTO shifts (
       id, opened_by_id, opened_by_name, closed_by_id, closed_by_name,
@@ -125,17 +150,33 @@ async function syncShift(shift) {
     shift.cash_difference || null,
     shift.status,
   ]);
+
+  // Emitir evento de WebSocket si el turno es nuevo o cambió de estado
+  if (isNew || previousStatus !== shift.status) {
+    socketEvents.emitShiftChange({
+      shiftId: shift.id,
+      status: shift.status,
+      userName: shift.opened_by_name,
+    });
+  }
 }
 
 /**
  * Sincronizar una venta
- * @returns {boolean} true si es una venta nueva, false si ya existía
+ * @returns {boolean} true si la venta es nueva y completada (o pasó a completada por primera vez)
  */
 async function syncSale(sale) {
   // Verificar si la venta ya existe
   const existing = await query('SELECT id, status FROM sales WHERE id = ?', [sale.id]);
   const isNew = existing.length === 0;
   const previousStatus = existing.length > 0 ? existing[0].status : null;
+
+  // Determinar si necesita descuento de inventario:
+  // - Venta nueva con status completed
+  // - O venta existente que cambia a completed por primera vez
+  const needsInventoryDeduction =
+    (isNew && sale.status === 'completed') ||
+    (!isNew && previousStatus !== 'completed' && sale.status === 'completed');
 
   const sql = `
     INSERT INTO sales (
@@ -218,7 +259,7 @@ async function syncSale(sale) {
     });
   }
 
-  return isNew;
+  return needsInventoryDeduction;
 }
 
 /**
@@ -280,6 +321,9 @@ async function processInventoryDeduction(saleId) {
 
     if (product.manage_stock === 1) {
       // Producto con stock directo: restar cantidad vendida
+      const previousStock = product.stock_current;
+      const newStock = Math.max(0, previousStock - quantity);
+
       await query(
         `UPDATE products
          SET stock_current = GREATEST(0, stock_current - ?),
@@ -287,6 +331,16 @@ async function processInventoryDeduction(saleId) {
          WHERE id = ?`,
         [quantity, product_id]
       );
+
+      // Emitir evento de cambio de stock
+      const productInfo = await query('SELECT name FROM products WHERE id = ?', [product_id]);
+      socketEvents.emitStockChange({
+        productId: product_id,
+        productName: productInfo[0]?.name || 'Producto',
+        previousStock,
+        newStock,
+        reason: 'sale',
+      });
     } else {
       // Producto preparado: buscar receta y descontar insumos
       const recipes = await query(
@@ -300,14 +354,34 @@ async function processInventoryDeduction(saleId) {
         // Calcular cantidad total a descontar (cantidad vendida * cantidad por unidad)
         const totalToDeduct = quantity * quantity_required;
 
-        // Descontar del insumo
-        await query(
-          `UPDATE products
-           SET stock_current = GREATEST(0, stock_current - ?),
-               updated_at = CURRENT_TIMESTAMP
-           WHERE id = ?`,
-          [totalToDeduct, ingredient_id]
+        // Obtener stock actual del insumo
+        const ingredientInfo = await query(
+          'SELECT name, stock_current FROM products WHERE id = ?',
+          [ingredient_id]
         );
+
+        if (ingredientInfo.length > 0) {
+          const previousStock = ingredientInfo[0].stock_current;
+          const newStock = Math.max(0, previousStock - totalToDeduct);
+
+          // Descontar del insumo
+          await query(
+            `UPDATE products
+             SET stock_current = GREATEST(0, stock_current - ?),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`,
+            [totalToDeduct, ingredient_id]
+          );
+
+          // Emitir evento de cambio de stock del insumo
+          socketEvents.emitStockChange({
+            productId: ingredient_id,
+            productName: ingredientInfo[0].name,
+            previousStock,
+            newStock,
+            reason: 'recipe_deduction',
+          });
+        }
       }
     }
   }
@@ -394,11 +468,15 @@ async function syncSales(req, res) {
       inventory: { processed: 0, errors: [] },
     };
 
-    // Sincronizar ventas
+    // Sincronizar ventas y rastrear las que necesitan descuento de inventario
+    const salesNeedingInventoryDeduction = [];
     for (const sale of sales) {
       try {
-        await syncSale(sale);
+        const needsInventoryDeduction = await syncSale(sale);
         results.sales.synced++;
+        if (needsInventoryDeduction) {
+          salesNeedingInventoryDeduction.push(sale.id);
+        }
       } catch (error) {
         results.sales.errors.push({
           id: sale.id,
@@ -415,6 +493,20 @@ async function syncSales(req, res) {
       } catch (error) {
         results.sale_items.errors.push({
           id: item.id,
+          error: error.message,
+        });
+      }
+    }
+
+    // Procesar descuento de inventario para ventas que lo necesitan
+    for (const saleId of salesNeedingInventoryDeduction) {
+      try {
+        await processInventoryDeduction(saleId);
+        results.inventory.processed++;
+      } catch (error) {
+        console.error(`Error procesando inventario para venta ${saleId}:`, error);
+        results.inventory.errors.push({
+          saleId,
           error: error.message,
         });
       }
