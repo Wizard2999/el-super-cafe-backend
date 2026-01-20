@@ -39,4 +39,18 @@ router.get('/status', verifyToken, syncController.getSyncStatus);
  */
 router.get('/users', verifyToken, syncController.syncUsersToDevice);
 
+/**
+ * GET /api/shifts/open
+ * Obtener turnos abiertos (excluyendo el turno actual del dispositivo)
+ * Query params: exclude_shift_id (opcional)
+ */
+router.get('/shifts/open', verifyToken, syncController.getOpenShifts);
+
+/**
+ * PATCH /api/shifts/handover
+ * Traspasar ventas pendientes a otro turno
+ * Body: { sale_ids: string[], new_shift_id: string }
+ */
+router.patch('/shifts/handover', verifyToken, syncController.handoverPendingSales);
+
 module.exports = router;

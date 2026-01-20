@@ -722,6 +722,159 @@ async function syncUsersToDevice(req, res) {
   }
 }
 
+/**
+ * PATCH /api/sync/shifts/handover
+ * Traspasar ventas pendientes de un turno a otro
+ * Body: { sale_ids: string[], new_shift_id: string }
+ */
+async function handoverPendingSales(req, res) {
+  try {
+    const { sale_ids, new_shift_id } = req.body;
+
+    // Validar parámetros
+    if (!sale_ids || !Array.isArray(sale_ids) || sale_ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requiere un array de sale_ids',
+      });
+    }
+
+    if (!new_shift_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requiere new_shift_id',
+      });
+    }
+
+    // Verificar que el turno destino existe y está abierto
+    const targetShift = await query(
+      'SELECT id, status, opened_by_name FROM shifts WHERE id = ?',
+      [new_shift_id]
+    );
+
+    if (targetShift.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'El turno destino no existe',
+      });
+    }
+
+    if (targetShift[0].status !== 'open') {
+      return res.status(400).json({
+        success: false,
+        error: 'El turno destino no está abierto',
+      });
+    }
+
+    // Verificar que todas las ventas existen y están pendientes
+    const placeholders = sale_ids.map(() => '?').join(',');
+    const sales = await query(
+      `SELECT id, status, shift_id, table_id FROM sales WHERE id IN (${placeholders})`,
+      sale_ids
+    );
+
+    if (sales.length !== sale_ids.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'Algunas ventas no existen',
+      });
+    }
+
+    const nonPendingSales = sales.filter(s => s.status !== 'pending');
+    if (nonPendingSales.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Solo se pueden traspasar ventas pendientes',
+        invalidSales: nonPendingSales.map(s => s.id),
+      });
+    }
+
+    // Actualizar el shift_id de las ventas
+    await query(
+      `UPDATE sales SET shift_id = ?, is_synced = 1, updated_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`,
+      [new_shift_id, ...sale_ids]
+    );
+
+    // Emitir evento de WebSocket para notificar a todos los dispositivos
+    const updatedSales = await query(
+      `SELECT s.id, s.table_id, t.name as table_name
+       FROM sales s
+       LEFT JOIN cafe_tables t ON s.table_id = t.id
+       WHERE s.id IN (${placeholders})`,
+      sale_ids
+    );
+
+    // Notificar cambio de turno
+    socketEvents.broadcast('sales:handover', {
+      sale_ids,
+      new_shift_id,
+      target_shift_owner: targetShift[0].opened_by_name,
+      tables: updatedSales.map(s => ({ id: s.table_id, name: s.table_name })),
+    });
+
+    res.json({
+      success: true,
+      message: `${sale_ids.length} venta(s) traspasada(s) al turno de ${targetShift[0].opened_by_name}`,
+      data: {
+        transferred_count: sale_ids.length,
+        new_shift_id,
+        new_shift_owner: targetShift[0].opened_by_name,
+      },
+    });
+  } catch (error) {
+    console.error('Error en handover de ventas:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error al traspasar las ventas',
+    });
+  }
+}
+
+/**
+ * GET /api/sync/shifts/open
+ * Obtener turnos abiertos (para seleccionar destino de traspaso)
+ */
+async function getOpenShifts(req, res) {
+  try {
+    const { exclude_shift_id } = req.query;
+
+    let sql = `
+      SELECT id, opened_by_id, opened_by_name, start_time, initial_cash, status
+      FROM shifts
+      WHERE status = 'open'
+    `;
+    const params = [];
+
+    // Excluir el turno actual si se proporciona
+    if (exclude_shift_id) {
+      sql += ' AND id != ?';
+      params.push(exclude_shift_id);
+    }
+
+    sql += ' ORDER BY start_time DESC';
+
+    const shifts = await query(sql, params);
+
+    res.json({
+      success: true,
+      data: shifts.map(s => ({
+        id: s.id,
+        opened_by_id: s.opened_by_id,
+        opened_by_name: s.opened_by_name,
+        start_time: s.start_time,
+        initial_cash: parseFloat(s.initial_cash),
+        status: s.status,
+      })),
+    });
+  } catch (error) {
+    console.error('Error obteniendo turnos abiertos:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error obteniendo turnos abiertos',
+    });
+  }
+}
+
 module.exports = {
   syncFromDevice,
   syncSales,
@@ -729,4 +882,6 @@ module.exports = {
   getSyncStatus,
   syncUsersToDevice,
   processInventoryDeduction,
+  handoverPendingSales,
+  getOpenShifts,
 };
