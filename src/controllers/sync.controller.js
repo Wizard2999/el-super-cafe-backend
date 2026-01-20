@@ -3,6 +3,28 @@ const { v4: uuidv4 } = require('uuid');
 const socketEvents = require('../services/socketEvents');
 
 /**
+ * Emitir evento order:update con items incluidos
+ * Se llama DESPUÉS de que los items estén sincronizados
+ */
+async function emitOrderUpdateWithItems(saleId, tableId) {
+  try {
+    const saleItems = await query(
+      'SELECT id, sale_id, product_id, product_name, quantity, unit_price FROM sale_items WHERE sale_id = ?',
+      [saleId]
+    );
+
+    socketEvents.emitOrderUpdate({
+      tableId,
+      saleId,
+      items: saleItems,
+      status: 'pending',
+    });
+  } catch (error) {
+    console.error(`Error emitiendo order:update para venta ${saleId}:`, error);
+  }
+}
+
+/**
  * POST /api/sync
  * Sincronizar datos desde el dispositivo al servidor
  * Body: { sales: [], sale_items: [], movements: [], shifts: [] }
@@ -22,9 +44,15 @@ async function syncFromDevice(req, res) {
     };
 
     // Sincronizar turnos primero (porque las ventas dependen de ellos)
+    // También rastrear si hay un turno abierto existente para informar al cliente
+    let existingOpenShift = null;
+
     for (const shift of shifts) {
       try {
-        await syncShift(shift);
+        const shiftResult = await syncShift(shift);
+        if (shiftResult && shiftResult.existingShift) {
+          existingOpenShift = shiftResult.existingShift;
+        }
         results.shifts.synced++;
       } catch (error) {
         results.shifts.errors.push({
@@ -32,6 +60,11 @@ async function syncFromDevice(req, res) {
           error: error.message,
         });
       }
+    }
+
+    // Si hay un turno abierto existente, incluirlo en la respuesta
+    if (existingOpenShift) {
+      results.existingOpenShift = existingOpenShift;
     }
 
     // Sincronizar ventas y rastrear las que necesitan descuento de inventario
@@ -62,6 +95,13 @@ async function syncFromDevice(req, res) {
           id: item.id,
           error: error.message,
         });
+      }
+    }
+
+    // Emitir eventos de order:update para ventas pendientes DESPUÉS de que los items estén sincronizados
+    for (const sale of sales) {
+      if (sale.status === 'pending' && sale.table_id) {
+        await emitOrderUpdateWithItems(sale.id, sale.table_id);
       }
     }
 
@@ -113,12 +153,48 @@ async function syncFromDevice(req, res) {
 
 /**
  * Sincronizar un turno
+ * Si se intenta crear un turno nuevo con status='open' pero ya existe otro turno abierto,
+ * se devuelve el turno existente en lugar de crear uno nuevo (unicidad de turno)
  */
 async function syncShift(shift) {
   // Verificar si es un turno nuevo o actualización
   const existing = await query('SELECT id, status FROM shifts WHERE id = ?', [shift.id]);
   const isNew = existing.length === 0;
   const previousStatus = existing.length > 0 ? existing[0].status : null;
+
+  // VALIDACIÓN DE UNICIDAD: Si se intenta crear un nuevo turno abierto
+  if (isNew && shift.status === 'open') {
+    // Verificar si ya existe OTRO turno abierto
+    const existingOpenShifts = await query(
+      'SELECT id, opened_by_id, opened_by_name, start_time, initial_cash, status FROM shifts WHERE status = ? AND id != ?',
+      ['open', shift.id]
+    );
+
+    if (existingOpenShifts.length > 0) {
+      // Ya existe un turno abierto - emitir evento y devolver info del existente
+      const openShift = existingOpenShifts[0];
+      console.log(`[Shift] Ya existe turno abierto ${openShift.id}, no se crea duplicado`);
+
+      // Emitir evento para notificar al dispositivo que ya hay un turno abierto
+      socketEvents.emitShiftChange({
+        shiftId: openShift.id,
+        status: 'open',
+        userName: openShift.opened_by_name,
+      });
+
+      // Retornar información del turno existente (el dispositivo debe usar este)
+      return {
+        existingShift: {
+          id: openShift.id,
+          opened_by_id: openShift.opened_by_id,
+          opened_by_name: openShift.opened_by_name,
+          start_time: openShift.start_time,
+          initial_cash: parseFloat(openShift.initial_cash),
+          status: openShift.status,
+        }
+      };
+    }
+  }
 
   const sql = `
     INSERT INTO shifts (
@@ -245,19 +321,9 @@ async function syncSale(sale) {
       status: 'occupied',
       currentSaleId: sale.id,
     });
-    socketEvents.emitOrderUpdate({
-      tableId: sale.table_id,
-      saleId: sale.id,
-      status: 'pending',
-    });
-  } else if (sale.status === 'pending' && !isNew) {
-    // Actualización de pedido existente
-    socketEvents.emitOrderUpdate({
-      tableId: sale.table_id,
-      saleId: sale.id,
-      status: 'pending',
-    });
+    // NOTA: El evento order:update se emite después de sincronizar los items
   }
+  // Para ventas pendientes, el evento order:update se emite después de sincronizar los items
 
   return needsInventoryDeduction;
 }
@@ -495,6 +561,13 @@ async function syncSales(req, res) {
           id: item.id,
           error: error.message,
         });
+      }
+    }
+
+    // Emitir eventos de order:update para ventas pendientes DESPUÉS de que los items estén sincronizados
+    for (const sale of sales) {
+      if (sale.status === 'pending' && sale.table_id) {
+        await emitOrderUpdateWithItems(sale.id, sale.table_id);
       }
     }
 
