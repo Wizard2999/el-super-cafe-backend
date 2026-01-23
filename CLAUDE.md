@@ -292,3 +292,57 @@ npm install
 - El descuento de inventario **solo ocurre para ventas nuevas completadas** - re-sincronizar la misma venta no duplica el descuento
 - **Evento `movement:create`** incluye `shiftId` para que los dispositivos puedan asociar gastos al turno correcto
 - **Endpoint `/api/sync/sales/pending`** retorna ventas, items y mesas ocupadas para sincronización PULL antes de PUSH
+
+## Transit State: Handover de Mesas entre Turnos
+
+### Concepto
+El "Transit State" permite traspasar mesas pendientes de un usuario a otro sin crear el turno del receptor inmediatamente. Las ventas quedan en un estado de tránsito hasta que el receptor abra su turno.
+
+### Flujo de Usuario A (cerrando turno)
+1. En `CashCloseModal`, si hay ventas pendientes, aparece botón "Traspasar Mesas"
+2. Usuario A selecciona al receptor (Usuario B)
+3. Sistema llama a `POST /api/sync/shifts/transfer-tables` que:
+   - Establece `shift_id = NULL` en las ventas
+   - Establece `pending_receiver_user_id = Usuario B's ID`
+4. Usuario A puede completar su arqueo de caja y cerrar turno normalmente
+
+### Flujo de Usuario B (abriendo turno)
+1. Usuario B abre su turno manualmente como siempre
+2. Al crear el turno, `syncShift()` llama a `linkOrphanSalesToShift()`:
+   - Busca ventas donde `shift_id IS NULL AND pending_receiver_user_id = Usuario B's ID`
+   - Las vincula al nuevo turno: `shift_id = nuevo_turno_id, pending_receiver_user_id = NULL`
+3. Frontend ejecuta `SyncService.syncAll()` para descargar las mesas traspasadas
+
+### Endpoints Relacionados
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| POST | `/api/sync/shifts/transfer-tables` | Traspasa ventas pendientes a un usuario receptor |
+
+### Campo `pending_receiver_user_id` en `sales`
+- `VARCHAR(36)` - ID del usuario que recibirá las ventas al abrir su turno
+- Solo tiene valor cuando las ventas están en tránsito (`shift_id IS NULL`)
+- Se limpia automáticamente al vincular las ventas al nuevo turno
+
+### Eventos de Socket
+- `sales:transfer`: Notifica que ventas fueron traspasadas a un usuario
+- `sales:linked`: Notifica que ventas huérfanas fueron vinculadas a un turno
+
+### Respuesta de Sincronización con Mesas Heredadas
+Cuando User B abre su turno y el backend vincula ventas huérfanas, la respuesta de `/api/sync` incluye:
+```json
+{
+  "success": true,
+  "data": {
+    "shifts": { "synced": 1, "errors": [] },
+    "linkedSalesInfo": {
+      "shiftId": "uuid-del-nuevo-turno",
+      "linkedSalesCount": 3,
+      "linkedTables": [
+        { "id": "table-uuid-1", "name": "Mesa 1" },
+        { "id": "table-uuid-2", "name": "Mesa 2" }
+      ]
+    }
+  }
+}
+```
+El frontend usa esta información para mostrar el modal de bienvenida a User B.

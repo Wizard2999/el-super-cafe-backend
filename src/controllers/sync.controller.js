@@ -46,12 +46,21 @@ async function syncFromDevice(req, res) {
     // Sincronizar turnos primero (porque las ventas dependen de ellos)
     // También rastrear si hay un turno abierto existente para informar al cliente
     let existingOpenShift = null;
+    let linkedSalesInfo = null;
 
     for (const shift of shifts) {
       try {
         const shiftResult = await syncShift(shift);
         if (shiftResult && shiftResult.existingShift) {
           existingOpenShift = shiftResult.existingShift;
+        }
+        // Capture linked sales info for Transit State handover
+        if (shiftResult && shiftResult.linkedSalesCount > 0) {
+          linkedSalesInfo = {
+            shiftId: shift.id,
+            linkedSalesCount: shiftResult.linkedSalesCount,
+            linkedTables: shiftResult.linkedTables || [],
+          };
         }
         results.shifts.synced++;
       } catch (error) {
@@ -65,6 +74,11 @@ async function syncFromDevice(req, res) {
     // Si hay un turno abierto existente, incluirlo en la respuesta
     if (existingOpenShift) {
       results.existingOpenShift = existingOpenShift;
+    }
+
+    // Si se vincularon ventas huérfanas (Transit State), incluirlo en la respuesta
+    if (linkedSalesInfo) {
+      results.linkedSalesInfo = linkedSalesInfo;
     }
 
     // Sincronizar ventas y rastrear las que necesitan descuento de inventario
@@ -234,6 +248,19 @@ async function syncShift(shift) {
       status: shift.status,
       userName: shift.opened_by_name,
     });
+  }
+
+  // TRANSIT STATE: If a new shift is created with status 'open',
+  // link any orphan sales assigned to this user
+  if (isNew && shift.status === 'open' && shift.opened_by_id) {
+    const linkResult = await linkOrphanSalesToShift(shift.opened_by_id, shift.id);
+    if (linkResult.count > 0) {
+      console.log(`[Shift] Linked ${linkResult.count} orphan sales to new shift ${shift.id}`);
+      return {
+        linkedSalesCount: linkResult.count,
+        linkedTables: linkResult.tables,
+      };
+    }
   }
 }
 
@@ -1140,6 +1167,190 @@ async function atomicShiftHandover(req, res) {
   }
 }
 
+/**
+ * POST /api/sync/shifts/transfer-tables
+ * Transit State: Transfer pending sales to a receiver user without creating their shift yet.
+ * Sets shift_id = NULL and pending_receiver_user_id = receiver_user_id.
+ * User A can then complete their shift closure normally.
+ * When User B opens their shift, the sales will be automatically linked.
+ * Body: { sale_ids: string[], receiver_user_id: string }
+ */
+async function transferTablesToUser(req, res) {
+  try {
+    const { sale_ids, receiver_user_id } = req.body;
+
+    // Validate parameters
+    if (!sale_ids || !Array.isArray(sale_ids) || sale_ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requiere un array de sale_ids',
+      });
+    }
+
+    if (!receiver_user_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requiere receiver_user_id',
+      });
+    }
+
+    // Verify receiver user exists and is active
+    const receiverUsers = await query(
+      'SELECT id, name, is_active FROM users WHERE id = ?',
+      [receiver_user_id]
+    );
+
+    if (receiverUsers.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Usuario receptor no encontrado',
+      });
+    }
+
+    if (!receiverUsers[0].is_active) {
+      return res.status(400).json({
+        success: false,
+        error: 'Usuario receptor no está activo',
+      });
+    }
+
+    const receiver = receiverUsers[0];
+
+    // Verify all sales exist and are pending
+    const placeholders = sale_ids.map(() => '?').join(',');
+    const sales = await query(
+      `SELECT id, status, shift_id, table_id FROM sales WHERE id IN (${placeholders})`,
+      sale_ids
+    );
+
+    if (sales.length !== sale_ids.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'Algunas ventas no existen',
+      });
+    }
+
+    const nonPendingSales = sales.filter(s => s.status !== 'pending');
+    if (nonPendingSales.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Solo se pueden traspasar ventas pendientes',
+        invalidSales: nonPendingSales.map(s => s.id),
+      });
+    }
+
+    // Update sales: set shift_id = NULL and pending_receiver_user_id = receiver_user_id
+    await query(
+      `UPDATE sales
+       SET shift_id = NULL,
+           pending_receiver_user_id = ?,
+           is_synced = 1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id IN (${placeholders})`,
+      [receiver_user_id, ...sale_ids]
+    );
+
+    // Get updated sales with table info for socket event
+    const updatedSales = await query(
+      `SELECT s.id, s.table_id, t.name as table_name
+       FROM sales s
+       LEFT JOIN cafe_tables t ON s.table_id = t.id
+       WHERE s.id IN (${placeholders})`,
+      sale_ids
+    );
+
+    // Emit socket event to notify devices about the transfer
+    socketEvents.broadcast('sales:transfer', {
+      sale_ids,
+      receiver_user_id,
+      receiver_name: receiver.name,
+      tables: updatedSales.map(s => ({ id: s.table_id, name: s.table_name })),
+    });
+
+    res.json({
+      success: true,
+      message: `${sale_ids.length} mesa(s) traspasada(s) a ${receiver.name}. Esperando que abra su turno.`,
+      data: {
+        transferred_count: sale_ids.length,
+        receiver_user_id,
+        receiver_name: receiver.name,
+        tables: updatedSales.map(s => ({ id: s.table_id, name: s.table_name })),
+      },
+    });
+  } catch (error) {
+    console.error('Error en transferTablesToUser:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error al traspasar las mesas',
+    });
+  }
+}
+
+/**
+ * Link orphan sales to a shift.
+ * Called when a user opens a shift to link any pending sales assigned to them.
+ * @param {string} userId - The user ID who is opening the shift
+ * @param {string} shiftId - The new shift ID to link the sales to
+ * @returns {Promise<{count: number, tables: Array<{id: string, name: string}>}>} - Linked sales info
+ */
+async function linkOrphanSalesToShift(userId, shiftId) {
+  try {
+    // Find orphan sales: status='pending', shift_id IS NULL, pending_receiver_user_id = userId
+    const orphanSales = await query(
+      `SELECT id, table_id FROM sales
+       WHERE status = 'pending'
+       AND shift_id IS NULL
+       AND pending_receiver_user_id = ?`,
+      [userId]
+    );
+
+    if (orphanSales.length === 0) {
+      return { count: 0, tables: [] };
+    }
+
+    const saleIds = orphanSales.map(s => s.id);
+    const placeholders = saleIds.map(() => '?').join(',');
+
+    // Link sales to the new shift and clear pending_receiver_user_id
+    await query(
+      `UPDATE sales
+       SET shift_id = ?,
+           pending_receiver_user_id = NULL,
+           is_synced = 1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id IN (${placeholders})`,
+      [shiftId, ...saleIds]
+    );
+
+    console.log(`[Handover] Linked ${saleIds.length} orphan sales to shift ${shiftId}`);
+
+    // Get linked sales with table info
+    const linkedSales = await query(
+      `SELECT s.id, s.table_id, t.name as table_name
+       FROM sales s
+       LEFT JOIN cafe_tables t ON s.table_id = t.id
+       WHERE s.id IN (${placeholders})`,
+      saleIds
+    );
+
+    const tables = linkedSales
+      .filter(s => s.table_id)
+      .map(s => ({ id: s.table_id, name: s.table_name || 'Mesa' }));
+
+    // Emit socket event to notify devices about the linked sales
+    socketEvents.broadcast('sales:linked', {
+      sale_ids: saleIds,
+      shift_id: shiftId,
+      tables,
+    });
+
+    return { count: saleIds.length, tables };
+  } catch (error) {
+    console.error('Error linking orphan sales:', error);
+    return { count: 0, tables: [] };
+  }
+}
+
 module.exports = {
   syncFromDevice,
   syncSales,
@@ -1152,4 +1363,6 @@ module.exports = {
   getPendingSales,
   handoverAndCloseShift,
   atomicShiftHandover,
+  transferTablesToUser,
+  linkOrphanSalesToShift,
 };

@@ -63,6 +63,14 @@ router.post('/shifts/handover-and-close', verifyToken, syncController.handoverAn
 router.post('/handover', verifyToken, syncController.atomicShiftHandover);
 
 /**
+ * POST /api/sync/shifts/transfer-tables
+ * Transit State: Traspasa ventas pendientes a un usuario receptor sin crear su turno.
+ * El receptor recibirá las mesas cuando abra su turno.
+ * Body: { sale_ids: string[], receiver_user_id: string }
+ */
+router.post('/shifts/transfer-tables', verifyToken, syncController.transferTablesToUser);
+
+/**
  * GET /api/sync/sales/pending
  * Obtener ventas pendientes
  */
