@@ -105,6 +105,8 @@ El backend es la **Fuente de Verdad** para todos los datos:
 |--------|----------|-------------|
 | GET | `/api/sync/users` | Descargar usuarios al dispositivo (requiere auth, incluye PIN hash) |
 | GET | `/api/catalog/full` | Descargar catálogo completo (categorías, productos, recetas, mesas) |
+| GET | `/api/sync/sales/pending` | Descargar ventas pendientes (pedidos activos en mesas ocupadas) |
+| GET | `/api/sync/shifts/open` | Obtener turno(s) abierto(s) para adopción global |
 
 ### Endpoints de Catálogo
 | Método | Endpoint | Rol | Descripción |
@@ -288,3 +290,5 @@ npm install
 - El campo `observation` en `sales` es para explicar por qué un cliente no pagó (deuda/fiado)
 - `processInventoryDeduction(saleId)` está exportada en sync.controller.js para uso externo si es necesario
 - El descuento de inventario **solo ocurre para ventas nuevas completadas** - re-sincronizar la misma venta no duplica el descuento
+- **Evento `movement:create`** incluye `shiftId` para que los dispositivos puedan asociar gastos al turno correcto
+- **Endpoint `/api/sync/sales/pending`** retorna ventas, items y mesas ocupadas para sincronización PULL antes de PUSH

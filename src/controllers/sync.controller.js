@@ -488,6 +488,7 @@ async function syncMovement(movement) {
       type: movement.type,
       amount: movement.amount,
       description: movement.description,
+      shiftId: movement.shift_id || null,
     });
   }
 }
@@ -875,6 +876,270 @@ async function getOpenShifts(req, res) {
   }
 }
 
+/**
+ * GET /api/sync/sales/pending
+ * Obtener ventas pendientes (pedidos activos en mesas)
+ * Útil para sincronizar pedidos entre dispositivos al reconectar
+ */
+async function getPendingSales(req, res) {
+  try {
+    // Obtener ventas pendientes con información de mesa
+    const sales = await query(`
+      SELECT s.id, s.total, s.payment_method, s.status, s.observation,
+             s.shift_id, s.table_id, s.print_count, s.created_at,
+             t.name as table_name
+      FROM sales s
+      LEFT JOIN cafe_tables t ON s.table_id = t.id
+      WHERE s.status = 'pending'
+      ORDER BY s.created_at DESC
+    `);
+
+    // Obtener items de todas las ventas pendientes
+    let saleItems = [];
+    if (sales.length > 0) {
+      const saleIds = sales.map(s => s.id);
+      const placeholders = saleIds.map(() => '?').join(',');
+      saleItems = await query(
+        `SELECT id, sale_id, product_id, product_name, quantity, unit_price
+         FROM sale_items
+         WHERE sale_id IN (${placeholders})`,
+        saleIds
+      );
+    }
+
+    // Obtener estado actual de mesas ocupadas
+    const occupiedTables = await query(`
+      SELECT id, name, status
+      FROM cafe_tables
+      WHERE status = 'occupied'
+    `);
+
+    res.json({
+      success: true,
+      data: {
+        sales: sales.map(s => ({
+          ...s,
+          total: parseFloat(s.total),
+          created_at: s.created_at,
+        })),
+        sale_items: saleItems.map(item => ({
+          ...item,
+          unit_price: parseFloat(item.unit_price),
+        })),
+        tables: occupiedTables,
+      },
+      count: {
+        sales: sales.length,
+        items: saleItems.length,
+        tables: occupiedTables.length,
+      },
+    });
+  } catch (error) {
+    console.error('Error obteniendo ventas pendientes:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error obteniendo ventas pendientes',
+    });
+  }
+}
+
+/**
+ * POST /api/sync/shifts/handover-and-close
+ * Orquesta el traspaso de todas las ventas pendientes de un turno
+ * a un nuevo turno de un usuario receptor y cierra el turno actual.
+ * Body: { current_shift_id: string, receiver_user_id: string, receiver_initial_cash: number }
+ */
+async function handoverAndCloseShift(req, res) {
+  try {
+    const { current_shift_id, receiver_user_id, receiver_initial_cash } = req.body;
+
+    if (!current_shift_id || !receiver_user_id || typeof receiver_initial_cash !== 'number') {
+      return res.status(400).json({
+        success: false,
+        error: 'Parámetros inválidos: current_shift_id, receiver_user_id y receiver_initial_cash son requeridos',
+      });
+    }
+
+    // Validar turno actual
+    const currentShiftRows = await query('SELECT id, status, opened_by_id, opened_by_name FROM shifts WHERE id = ?', [current_shift_id]);
+    if (currentShiftRows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Turno actual no encontrado' });
+    }
+    const currentShift = currentShiftRows[0];
+    if (currentShift.status !== 'open') {
+      return res.status(400).json({ success: false, error: 'El turno actual no está abierto' });
+    }
+
+    // Ventas pendientes del turno actual
+    const pendingSales = await query(
+      'SELECT id, table_id FROM sales WHERE shift_id = ? AND status = "pending"',
+      [current_shift_id]
+    );
+
+    // Validar usuario receptor
+    const receiverRows = await query('SELECT id, name FROM users WHERE id = ? AND is_active = 1', [receiver_user_id]);
+    if (receiverRows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Usuario receptor no encontrado o inactivo' });
+    }
+    const receiver = receiverRows[0];
+
+    // Crear nuevo turno para receptor
+    const newShiftId = uuidv4();
+    await query(
+      `INSERT INTO shifts (id, opened_by_id, opened_by_name, start_time, initial_cash, status, is_synced)
+       VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 'open', 1)`,
+      [newShiftId, receiver.id, receiver.name, receiver_initial_cash]
+    );
+
+    let transferredCount = 0;
+    if (pendingSales.length > 0) {
+      const saleIds = pendingSales.map(s => s.id);
+      const placeholders = saleIds.map(() => '?').join(',');
+      await query(
+        `UPDATE sales SET shift_id = ?, is_synced = 1, updated_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`,
+        [newShiftId, ...saleIds]
+      );
+      transferredCount = saleIds.length;
+
+      // Emitir handover de ventas (incluye mesas)
+      const updatedSales = await query(
+        `SELECT s.id, s.table_id, t.name as table_name
+         FROM sales s
+         LEFT JOIN cafe_tables t ON s.table_id = t.id
+         WHERE s.id IN (${placeholders})`,
+        saleIds
+      );
+      socketEvents.broadcast('sales:handover', {
+        sale_ids: saleIds,
+        new_shift_id: newShiftId,
+        target_shift_owner: receiver.name,
+        tables: updatedSales.map(s => ({ id: s.table_id, name: s.table_name })),
+      });
+    }
+
+    // Cerrar turno actual
+    const closedByName = req.user?.name || currentShift.opened_by_name;
+    const closedById = req.user?.id || currentShift.opened_by_id;
+    await query(
+      `UPDATE shifts SET end_time = CURRENT_TIMESTAMP, status = 'closed', closed_by_id = ?, closed_by_name = ?, is_synced = 1 WHERE id = ?`,
+      [closedById, closedByName, current_shift_id]
+    );
+
+    // Emitir eventos de cambio de turno
+    socketEvents.emitShiftChange({ shiftId: current_shift_id, status: 'closed', userName: closedByName });
+    socketEvents.emitShiftChange({ shiftId: newShiftId, status: 'open', userName: receiver.name });
+
+    return res.json({
+      success: true,
+      message: 'Traspaso y cierre realizados correctamente',
+      data: {
+        transferred_count: transferredCount,
+        new_shift_id: newShiftId,
+        new_shift_owner: receiver.name,
+        closed_shift_id: current_shift_id,
+      },
+    });
+  } catch (error) {
+    console.error('Error en handover-and-close:', error);
+    return res.status(500).json({ success: false, error: 'Error en traspaso y cierre' });
+  }
+}
+
+// POST /api/sync/handover
+// Cierre atómico del turno A, creación del turno B con estado 'waiting_initial_cash',
+// y traspaso de ventas pendientes de A a B en una sola transacción.
+async function atomicShiftHandover(req, res) {
+  try {
+    const { current_shift_id, incoming_user_id, cash_final_reported, final_cash_reported } = req.body;
+    const finalCash = typeof cash_final_reported !== 'undefined' ? cash_final_reported : final_cash_reported;
+
+    // Validar parámetros mínimos
+    if (!current_shift_id || !incoming_user_id) {
+      return res.status(400).json({ success: false, error: 'Se requieren current_shift_id e incoming_user_id' });
+    }
+
+    // Validar turno actual
+    const currentShiftRows = await query(
+      'SELECT id, status, opened_by_id, opened_by_name FROM shifts WHERE id = ?',
+      [current_shift_id]
+    );
+    if (currentShiftRows.length === 0) {
+      return res.status(404).json({ success: false, error: 'El turno actual no existe' });
+    }
+    const currentShift = currentShiftRows[0];
+    if (currentShift.status !== 'open') {
+      return res.status(400).json({ success: false, error: 'El turno actual no está abierto' });
+    }
+
+    // Validar usuario receptor
+    const receiverRows = await query(
+      'SELECT id, name, is_active FROM users WHERE id = ?',
+      [incoming_user_id]
+    );
+    if (receiverRows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Usuario receptor no existe' });
+    }
+    const receiver = receiverRows[0];
+    if (parseInt(receiver.is_active) !== 1) {
+      return res.status(400).json({ success: false, error: 'Usuario receptor no está activo' });
+    }
+
+    const newShiftId = uuidv4();
+
+    // Ejecutar transacción atómica
+    const txResult = await transaction(async (conn) => {
+      const closedById = req.user?.id || currentShift.opened_by_id;
+      const closedByName = req.user?.name || currentShift.opened_by_name;
+
+      // Paso A: Cerrar turno A y guardar final_cash_reported
+      await conn.execute(
+        `UPDATE shifts
+         SET end_time = CURRENT_TIMESTAMP,
+             status = 'closed',
+             final_cash_reported = ?,
+             closed_by_id = ?,
+             closed_by_name = ?,
+             is_synced = 1
+         WHERE id = ?`,
+        [finalCash ?? null, closedById, closedByName, current_shift_id]
+      );
+
+      // Paso B: Crear turno B con estado 'waiting_initial_cash' e initial_cash = 0
+      await conn.execute(
+        `INSERT INTO shifts (id, opened_by_id, opened_by_name, start_time, initial_cash, status, is_synced)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP, 0, 'waiting_initial_cash', 1)`,
+        [newShiftId, receiver.id, receiver.name]
+      );
+
+      // Paso C: Traspasar ventas pendientes de A a B
+      const [updateRes] = await conn.execute(
+        `UPDATE sales SET shift_id = ? WHERE shift_id = ? AND status = 'pending'`,
+        [newShiftId, current_shift_id]
+      );
+
+      const transferredCount = updateRes.affectedRows || 0;
+
+      return { transferredCount, closedByName };
+    });
+
+    // Paso D: Emitir eventos de WebSocket
+    socketEvents.emitShiftChange({ shiftId: current_shift_id, status: 'closed', userName: txResult.closedByName });
+    socketEvents.emitShiftChange({ shiftId: newShiftId, status: 'waiting_initial_cash', userName: receiver.name });
+
+    return res.json({
+      success: true,
+      message: 'Handover atómico completado',
+      data: {
+        new_shift_id: newShiftId,
+        transferred_count: txResult.transferredCount,
+      },
+    });
+  } catch (error) {
+    console.error('Error en atomicShiftHandover:', error);
+    return res.status(500).json({ success: false, error: 'Error en traspaso atómico' });
+  }
+}
+
 module.exports = {
   syncFromDevice,
   syncSales,
@@ -884,4 +1149,7 @@ module.exports = {
   processInventoryDeduction,
   handoverPendingSales,
   getOpenShifts,
+  getPendingSales,
+  handoverAndCloseShift,
+  atomicShiftHandover,
 };

@@ -213,6 +213,10 @@ app.use('/api/reports', reportsRoutes);
 // Rutas de catálogo
 app.use('/api/catalog', catalogRoutes);
 
+// Rutas de turnos
+const shiftsRoutes = require('./routes/shifts.routes');
+app.use('/api/shifts', shiftsRoutes);
+
 // ============================================
 // MANEJO DE ERRORES
 // ============================================

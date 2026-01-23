@@ -44,6 +44,10 @@ async function upsertCategory(req, res) {
       });
     }
 
+    // Verificar si existe para determinar acción
+    const existing = await query('SELECT id FROM categories WHERE id = ?', [id]);
+    const action = existing.length > 0 ? 'update' : 'create';
+
     await query(
       `INSERT INTO categories (id, name, color, is_synced)
        VALUES (?, ?, ?, 1)
@@ -54,6 +58,14 @@ async function upsertCategory(req, res) {
          updated_at = CURRENT_TIMESTAMP`,
       [id, name, color || '#6B7280']
     );
+
+    // Emitir actualización de catálogo
+    socketEvents.emitCatalogUpdate({
+      type: 'category',
+      action,
+      id,
+      data: { id, name, color: color || '#6B7280' },
+    });
 
     res.json({
       success: true,
@@ -90,6 +102,9 @@ async function deleteCategory(req, res) {
     }
 
     await query('DELETE FROM categories WHERE id = ?', [id]);
+
+    // Emitir actualización de catálogo
+    socketEvents.emitCatalogUpdate({ type: 'category', action: 'delete', id });
 
     res.json({
       success: true,
@@ -149,6 +164,15 @@ async function upsertProduct(req, res) {
       });
     }
 
+    // Obtener producto existente para determinar acción y comparar stock
+    const existing = await query(
+      'SELECT id, name, manage_stock, stock_current FROM products WHERE id = ?',
+      [id]
+    );
+    const action = existing.length > 0 ? 'update' : 'create';
+    const previousStock = existing.length > 0 ? Number(existing[0].stock_current) : 0;
+    const previousName = existing.length > 0 ? existing[0].name : name;
+
     await query(
       `INSERT INTO products (id, name, category_id, price, manage_stock, stock_current, unit, is_synced)
        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
@@ -171,6 +195,34 @@ async function upsertProduct(req, res) {
         unit || 'unid',
       ]
     );
+
+    // Emitir actualización de catálogo
+    socketEvents.emitCatalogUpdate({
+      type: 'product',
+      action,
+      id,
+      data: {
+        id,
+        name,
+        category_id,
+        price: price || 0,
+        manage_stock: manage_stock ? 1 : 0,
+        stock_current: stock_current || 0,
+        unit: unit || 'unid',
+      },
+    });
+
+    // Emitir cambio de stock si aplica
+    const newStock = Number(stock_current || 0);
+    if ((manage_stock ? 1 : 0) === 1 && previousStock !== newStock) {
+      socketEvents.emitStockChange({
+        productId: id,
+        productName: previousName,
+        previousStock,
+        newStock,
+        reason: action === 'create' ? 'initial_stock' : 'admin_update',
+      });
+    }
 
     res.json({
       success: true,
@@ -211,6 +263,9 @@ async function deleteProduct(req, res) {
 
     // Eliminar producto
     await query('DELETE FROM products WHERE id = ?', [id]);
+
+    // Emitir actualización de catálogo
+    socketEvents.emitCatalogUpdate({ type: 'product', action: 'delete', id });
 
     res.json({
       success: true,
@@ -270,6 +325,10 @@ async function upsertRecipe(req, res) {
       });
     }
 
+    // Verificar si existe para determinar acción
+    const existing = await query('SELECT id FROM recipes WHERE id = ?', [id]);
+    const action = existing.length > 0 ? 'update' : 'create';
+
     await query(
       `INSERT INTO recipes (id, product_id, ingredient_id, quantity_required, is_synced)
        VALUES (?, ?, ?, ?, 1)
@@ -281,6 +340,14 @@ async function upsertRecipe(req, res) {
          updated_at = CURRENT_TIMESTAMP`,
       [id, product_id, ingredient_id, quantity_required || 0]
     );
+
+    // Emitir actualización de catálogo
+    socketEvents.emitCatalogUpdate({
+      type: 'recipe',
+      action,
+      id,
+      data: { id, product_id, ingredient_id, quantity_required: quantity_required || 0 },
+    });
 
     res.json({
       success: true,
@@ -304,6 +371,9 @@ async function deleteRecipe(req, res) {
     const { id } = req.params;
 
     await query('DELETE FROM recipes WHERE id = ?', [id]);
+
+    // Emitir actualización de catálogo
+    socketEvents.emitCatalogUpdate({ type: 'recipe', action: 'delete', id });
 
     res.json({
       success: true,
@@ -604,11 +674,8 @@ async function getFullCatalog(req, res) {
       },
     });
   } catch (error) {
-    console.error('Error obteniendo catálogo:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Error obteniendo catálogo',
-    });
+    console.error('Error obteniendo catálogo completo:', error);
+    res.status(500).json({ success: false, error: 'Error obteniendo catálogo completo' });
   }
 }
 
@@ -662,15 +729,7 @@ async function syncCatalog(req, res) {
              unit = VALUES(unit),
              is_synced = 1,
              updated_at = CURRENT_TIMESTAMP`,
-          [
-            prod.id,
-            prod.name,
-            prod.category_id,
-            prod.price || 0,
-            prod.manage_stock ? 1 : 0,
-            prod.stock_current || 0,
-            prod.unit || 'unid',
-          ]
+          [prod.id, prod.name, prod.category_id, prod.price || 0, prod.manage_stock ? 1 : 0, prod.stock_current || 0, prod.unit || 'unid']
         );
         results.products.synced++;
       } catch (error) {

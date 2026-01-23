@@ -97,9 +97,10 @@ function emitTableStatusChange({ tableId, tableName, status, currentSaleId }) {
  * @param {string} params.type - Tipo ('ingreso' | 'gasto')
  * @param {number} params.amount - Monto
  * @param {string} params.description - Descripción
+ * @param {string} [params.shiftId] - ID del turno asociado
  */
-function emitMovementCreate({ movementId, type, amount, description }) {
-  broadcast('movement:create', { movementId, type, amount, description });
+function emitMovementCreate({ movementId, type, amount, description, shiftId }) {
+  broadcast('movement:create', { movementId, type, amount, description, shiftId });
 }
 
 /**

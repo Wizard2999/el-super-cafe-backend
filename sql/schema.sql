@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS shifts (
     initial_cash DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
     final_cash_reported DECIMAL(12, 2) DEFAULT NULL,
     cash_difference DECIMAL(12, 2) DEFAULT NULL,
-    status ENUM('open', 'closed') NOT NULL DEFAULT 'open',
+    status ENUM('open', 'waiting_initial_cash', 'closed') NOT NULL DEFAULT 'open',
     is_synced TINYINT(1) NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
