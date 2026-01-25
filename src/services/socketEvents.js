@@ -91,6 +91,15 @@ function emitTableStatusChange({ tableId, tableName, status, currentSaleId }) {
 }
 
 /**
+ * Emite cuando se limpia una mesa (anulación completa)
+ * @param {object} params
+ * @param {string} params.tableId - ID de la mesa
+ */
+function emitTableCleaned({ tableId }) {
+  broadcast('table:cleaned', { tableId });
+}
+
+/**
  * Emite cuando se crea un nuevo movimiento (gasto/ingreso)
  * @param {object} params
  * @param {string} params.movementId - ID del movimiento
@@ -187,6 +196,7 @@ module.exports = {
   emitStockChange,
   emitSaleComplete,
   emitTableStatusChange,
+  emitTableCleaned,
   emitMovementCreate,
   emitCatalogUpdate,
   emitShiftChange,

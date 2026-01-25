@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS sales (
     id VARCHAR(36) PRIMARY KEY,
     total DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
     payment_method ENUM('efectivo', 'transferencia') NOT NULL DEFAULT 'efectivo',
-    status ENUM('pending', 'completed', 'unpaid_debt') NOT NULL DEFAULT 'pending',
+    status ENUM('pending', 'completed', 'unpaid_debt', 'cancelled') NOT NULL DEFAULT 'pending',
     observation TEXT DEFAULT NULL,
     unpaid_authorized_by_id VARCHAR(36) DEFAULT NULL,
     shift_id VARCHAR(36) DEFAULT NULL,

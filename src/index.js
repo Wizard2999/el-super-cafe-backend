@@ -13,6 +13,8 @@ const syncRoutes = require('./routes/sync.routes');
 const usersRoutes = require('./routes/users.routes');
 const reportsRoutes = require('./routes/reports.routes');
 const catalogRoutes = require('./routes/catalog.routes');
+const salesRoutes = require('./routes/sales.routes');
+const tablesRoutes = require('./routes/tables.routes');
 const socketEvents = require('./services/socketEvents');
 
 const app = express();
@@ -212,6 +214,12 @@ app.use('/api/reports', reportsRoutes);
 
 // Rutas de catálogo
 app.use('/api/catalog', catalogRoutes);
+
+// Rutas de ventas
+app.use('/api/sales', salesRoutes);
+
+// Rutas de mesas
+app.use('/api/tables', tablesRoutes);
 
 // Rutas de turnos
 const shiftsRoutes = require('./routes/shifts.routes');

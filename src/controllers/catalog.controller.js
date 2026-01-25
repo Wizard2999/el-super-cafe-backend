@@ -399,9 +399,12 @@ async function deleteRecipe(req, res) {
 async function getTables(req, res) {
   try {
     const tables = await query(
-      `SELECT id, name, status
-       FROM cafe_tables
-       ORDER BY name ASC`
+      `SELECT t.id, t.name, t.status,
+              COALESCE(s.total, 0) as current_total,
+              (SELECT COUNT(*) FROM sale_items si WHERE si.sale_id = s.id) as item_count
+       FROM cafe_tables t
+       LEFT JOIN sales s ON s.table_id = t.id AND s.status = 'pending'
+       ORDER BY t.name ASC`
     );
 
     res.json({
