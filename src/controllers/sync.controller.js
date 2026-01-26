@@ -101,15 +101,47 @@ async function syncFromDevice(req, res) {
     }
 
     // Sincronizar items de venta
+    // ESTRATEGIA UPDATE: Agrupar por sale_id y reemplazar items para evitar duplicados
+    // y recalcular el total real en el backend.
+    const itemsBySaleId = new Map();
     for (const item of sale_items) {
+      if (!itemsBySaleId.has(item.sale_id)) {
+        itemsBySaleId.set(item.sale_id, []);
+      }
+      itemsBySaleId.get(item.sale_id).push(item);
+    }
+
+    for (const [saleId, items] of itemsBySaleId) {
       try {
-        await syncSaleItem(item);
-        results.sale_items.synced++;
+        // 1. Limpiar items anteriores para esta venta (Opción A: Reemplazo total)
+        await query('DELETE FROM sale_items WHERE sale_id = ?', [saleId]);
+
+        // 2. Insertar la nueva lista completa
+        for (const item of items) {
+          await syncSaleItem(item);
+          results.sale_items.synced++;
+        }
+
+        // 3. Recalcular total en sales para asegurar consistencia
+        const [totalResult] = await query(
+          'SELECT SUM(quantity * unit_price) as total FROM sale_items WHERE sale_id = ?',
+          [saleId]
+        );
+        const newTotal = totalResult.total || 0;
+        
+        await query('UPDATE sales SET total = ? WHERE id = ?', [newTotal, saleId]);
+        
+        console.log(`[Sync] Venta ${saleId}: Items reemplazados y total recalculado a ${newTotal}`);
+
       } catch (error) {
-        results.sale_items.errors.push({
-          id: item.id,
-          error: error.message,
-        });
+        console.error(`Error sincronizando items para venta ${saleId}:`, error);
+        // Marcar error para cada item de esta venta
+        for (const item of items) {
+          results.sale_items.errors.push({
+            id: item.id,
+            error: error.message,
+          });
+        }
       }
     }
 
@@ -641,7 +673,10 @@ async function syncSales(req, res) {
               ]
             );
 
-            // 2. Crear items de la venta
+            // 2. Crear items de la venta (REPLACE STRATEGY)
+            // Borrar items anteriores para evitar duplicados y asegurar consistencia
+            await conn.execute('DELETE FROM sale_items WHERE sale_id = ?', [sale.id]);
+
             for (const item of saleItems) {
               await conn.execute(
                 `INSERT INTO sale_items (
@@ -656,10 +691,19 @@ async function syncSales(req, res) {
               );
             }
 
-            // 3. Descontar stock dentro de la misma transacción
+            // 3. Recalcular total real desde items
+            const [totalRes] = await conn.execute(
+              'SELECT SUM(quantity * unit_price) as total FROM sale_items WHERE sale_id = ?',
+              [sale.id]
+            );
+            const newTotal = totalRes[0].total || 0;
+            await conn.execute('UPDATE sales SET total = ? WHERE id = ?', [newTotal, sale.id]);
+
+            // 4. Descontar stock dentro de la misma transacción
+            // (Usamos los saleItems que acabamos de insertar/validar)
             await StockService.deductStockForItems(conn, saleItems);
 
-            // 4. Liberar mesa si aplica
+            // 5. Liberar mesa si aplica
             if (sale.table_id) {
               await conn.execute(
                 `UPDATE cafe_tables SET status = 'free', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -696,7 +740,11 @@ async function syncSales(req, res) {
           const needsInventoryDeduction = await syncSale(sale);
           results.sales.synced++;
 
-          // Sincronizar items de esta venta
+          // Sincronizar items de esta venta (REPLACE STRATEGY)
+          // 1. Limpiar items anteriores
+          await query('DELETE FROM sale_items WHERE sale_id = ?', [sale.id]);
+
+          // 2. Insertar nuevos items
           for (const item of saleItems) {
             try {
               await syncSaleItem(item);
@@ -707,6 +755,18 @@ async function syncSales(req, res) {
                 error: error.message,
               });
             }
+          }
+
+          // 3. Recalcular total real
+          try {
+            const [totalRes] = await query(
+              'SELECT SUM(quantity * unit_price) as total FROM sale_items WHERE sale_id = ?',
+              [sale.id]
+            );
+            const newTotal = totalRes.total || 0;
+            await query('UPDATE sales SET total = ? WHERE id = ?', [newTotal, sale.id]);
+          } catch (error) {
+            console.error(`Error recalculando total para venta ${sale.id}:`, error);
           }
 
           // Emitir order:update para ventas pendientes
