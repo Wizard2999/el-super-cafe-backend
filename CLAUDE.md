@@ -1,103 +1,40 @@
 # El Super Café - Backend API
 
-## Descripción
-API REST para el sistema POS de El Super Café. Proporciona endpoints para autenticación, sincronización de datos desde dispositivos offline-first, gestión de usuarios y reportes.
+## Comandos Principales
+- `npm run dev`: Iniciar servidor (desarrollo)
+- `npm start`: Iniciar servidor (producción)
+- `npm install`: Instalar dependencias
 
 ## Stack Tecnológico
-- **Runtime:** Node.js >= 18
-- **Framework:** Express.js 4.x
-- **Base de Datos:** MySQL 8.x
-- **Autenticación:** JWT (jsonwebtoken)
-- **Seguridad:** Helmet, CORS, Rate Limiting
-- **Driver MySQL:** mysql2/promise (con pool de conexiones)
-
-## Estructura del Proyecto
-```
-src/
-├── config/
-│   └── database.js       # Pool de conexiones MySQL
-├── controllers/
-│   ├── auth.controller.js
-│   ├── sync.controller.js
-│   ├── users.controller.js
-│   └── reports.controller.js
-├── middleware/
-│   └── auth.middleware.js  # verifyToken, requireAdmin
-├── routes/
-│   ├── auth.routes.js
-│   ├── sync.routes.js
-│   ├── users.routes.js
-│   └── reports.routes.js
-├── services/
-│   ├── socketEvents.js     # Eventos de WebSocket
-│   └── StockService.js     # Validación y descuento de stock
-├── utils/                  # (Reservado para utilidades)
-└── index.js               # Servidor principal Express
-```
+- Node.js >= 18, Express.js 4.x, MySQL 8.x
+- **Auth**: JWT
+- **Sockets**: Socket.io para tiempo real
 
 ## Base de Datos
+- **Schema**: `sql/schema.sql`
+- **Migración KDS**: `sql/migrations/003_kitchen_module.sql` (Requerido)
+- **Tablas Clave**: `users`, `sales`, `sale_items` (con `preparation_status`), `shifts`.
 
-### Versión del Schema: 1.0
+## Módulo KDS (Kitchen Display System)
+- **Endpoint**: `PATCH /api/sales/:saleId/items/:itemId/status`
+- **Socket Event**: `kitchen:update` (Broadcast cambios de estado a POS)
+- **Estados**: `pending`, `preparing`, `ready`, `delivered`
 
-### Tablas Principales
-| Tabla | Descripción |
-|-------|-------------|
-| `users` | Usuarios del sistema (admin, employee) |
-| `categories` | Categorías de productos |
-| `products` | Productos e insumos |
-| `recipes` | Recetas (ingredientes para productos preparados) |
-| `cafe_tables` | Mesas del establecimiento |
-| `shifts` | Turnos de caja (del dispositivo) |
-| `sales` | Ventas realizadas |
-| `sale_items` | Items de cada venta |
-| `movements` | Movimientos de caja (gastos, ingresos) |
-| `sync_log` | Registro de sincronizaciones |
+## Roles de Usuario
+- `admin`: Acceso total.
+- `employee`: Ventas y turnos.
+- `kitchen`: Acceso KDS.
+- `auxiliar_inventario`: Gestión de stock/productos.
 
-### Campos Importantes en `sales`
-- `status`: ENUM('pending', 'completed', 'unpaid_debt')
-- `observation`: TEXT - Razón de no pago (deudas)
-- `unpaid_authorized_by_id`: UUID del admin que autorizó la deuda
-- `print_count`: Contador de impresiones del ticket
+## Endpoints Principales
+- **/auth**: Login (`/login`, `/login-username`)
+- **/sync**: Sincronización masiva (`/`, `/sales`, `/movements`)
+- **/sales**: Gestión de ventas y estados de items.
 
-### Campos Importantes en `shifts`
-- `opened_by_id` / `opened_by_name`: Quién abrió el turno
-- `closed_by_id` / `closed_by_name`: Quién cerró el turno
-- El turno es del **dispositivo**, no del usuario individual
-
-## Autenticación
-
-### Flujo de Login
-1. Cliente envía `POST /api/auth/login` con `{ userId, pin }`
-2. Servidor valida PIN contra tabla `users`
-3. Si es válido, genera JWT con `{ userId, username, role }`
-4. Cliente guarda token y lo envía en header `Authorization: Bearer <token>`
-
-### Middleware de Auth
-- `verifyToken`: Valida JWT y agrega `req.user`
-- `requireAdmin`: Verifica que `req.user.role === 'admin'`
-
-### Tokens JWT
-- Payload: `{ userId, username, role }`
-- Expiración: Configurable via `JWT_EXPIRES_IN` (default: 24h)
-- Secret: Configurable via `JWT_SECRET`
-
-## Sincronización Proactiva (Servidor como Fuente de Verdad)
-
-### Filosofía
-El backend es la **Fuente de Verdad** para todos los datos:
-- Los dispositivos envían datos automáticamente sin intervención humana.
-- En caso de conflicto, el servidor tiene prioridad para catálogo (precios, productos, mesas).
-- La base de datos MySQL siempre tiene la información más reciente.
-
-### Flujo de Sincronización
-1. **Auto-Push Inmediato**: Cada venta/gasto se envía al backend inmediatamente después de guardarse en el dispositivo.
-2. **Auto-Pull al Login**: Al iniciar sesión, el dispositivo descarga catálogo + usuarios actualizados.
-3. **Intervalo de Respaldo**: Cada 5 minutos, el dispositivo verifica pendientes y sincroniza.
-4. **Prioridad del Servidor**: Al hacer pull, el catálogo del servidor sobrescribe el local.
-
-### Endpoints de Sync (Push - Subida)
-| Método | Endpoint | Descripción |
-|--------|----------|-------------|
+## Sincronización
+- **Filosofía**: Servidor es Fuente de Verdad.
+- **Flujo**: Push inmediato desde dispositivos -> DB MySQL.
+- **Stock**: `StockService.js` descuenta inventario basado en recetas y modificadores.
 | POST | `/api/sync` | Sincronización completa (shifts, sales, sale_items, movements) |
 | POST | `/api/sync/sales` | Solo ventas y sale_items |
 | POST | `/api/sync/movements` | Solo movimientos |
@@ -391,3 +328,46 @@ Cuando User B abre su turno y el backend vincula ventas huérfanas, la respuesta
 }
 ```
 El frontend usa esta información para mostrar el modal de bienvenida a User B.
+
+## Sistema de Inventario Inteligente
+
+### Migración SQL (`004_inventory_intelligence.sql`)
+Agrega:
+- `products.cost_unit`: Costo unitario para cálculo de utilidad
+- `products.stock_min`: Stock mínimo para alertas
+- `sales.gross_profit`: Utilidad bruta calculada
+- Tabla `stock_adjustments`: Historial de ajustes de inventario
+
+### Nuevas Funciones en `utils/math.js`
+| Función | Descripción |
+|---------|-------------|
+| `calculateSaleCost(items, queryFn)` | Calcula costo total de insumos para una venta |
+| `calculateGrossProfit(total, cost)` | Retorna utilidad bruta (Total - Costo) |
+
+### Cálculo de Utilidad Bruta
+- Se ejecuta automáticamente al sincronizar ventas `completed`
+- Considera productos directos (`manage_stock = 1`) y recetas
+- Aplica multiplicadores por modificadores (extras/exclusiones)
+- Resultado guardado en `sales.gross_profit`
+
+### Consumos Decimales
+- `StockService` soporta cantidades decimales (ej: 0.2 unidades de tomate)
+- `quantity_required` en recetas acepta decimales
+- Extras descuentan su respectivo insumo del stock
+
+### Tabla `stock_adjustments`
+```sql
+CREATE TABLE stock_adjustments (
+    id VARCHAR(36) PRIMARY KEY,
+    product_id VARCHAR(36) NOT NULL,
+    type ENUM('entrada', 'salida') NOT NULL,
+    quantity DECIMAL(12, 2) NOT NULL,
+    reason ENUM('compra', 'merma', 'dano', 'correccion', 'otro'),
+    description VARCHAR(255),
+    previous_stock DECIMAL(12, 2),
+    new_stock DECIMAL(12, 2),
+    created_by_id VARCHAR(36),
+    created_by_name VARCHAR(100),
+    ...
+);
+```

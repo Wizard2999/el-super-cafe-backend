@@ -2,17 +2,17 @@ const { query } = require('../config/database');
 const socketEvents = require('../services/socketEvents');
 
 /**
- * DELETE /api/sales/:saleId/items/:productId
- * Eliminar un item de una venta
+ * DELETE /api/sales/:saleId/items/:itemId
+ * Eliminar un item de una venta por su ID único (sale_items.id)
  */
 async function deleteSaleItem(req, res) {
   try {
-    const { saleId, productId } = req.params;
+    const { saleId, itemId } = req.params;
 
-    // 1. Eliminar el item
+    // 1. Eliminar el item por ID único
     const result = await query(
-      'DELETE FROM sale_items WHERE sale_id = ? AND product_id = ?',
-      [saleId, productId]
+      'DELETE FROM sale_items WHERE sale_id = ? AND id = ?',
+      [saleId, itemId]
     );
 
     if (result.affectedRows === 0) {
@@ -40,15 +40,26 @@ async function deleteSaleItem(req, res) {
       socketEvents.emitOrderUpdate({
         tableId,
         saleId,
-        items: remainingItems.map(item => ({
-          id: item.id,
-          sale_id: item.sale_id,
-          product_id: item.product_id,
-          product_name: item.product_name,
-          quantity: item.quantity,
-          unit_price: item.unit_price,
-          is_synced: 1
-        })),
+        items: remainingItems.map(item => {
+          let modifiers = item.modifiers;
+          if (typeof modifiers === 'string') {
+            try {
+              modifiers = JSON.parse(modifiers);
+            } catch (e) {
+              modifiers = [];
+            }
+          }
+          return {
+            id: item.id,
+            sale_id: item.sale_id,
+            product_id: item.product_id,
+            product_name: item.product_name,
+            quantity: item.quantity,
+            unit_price: item.unit_price,
+            modifiers,
+            is_synced: 1
+          };
+        }),
         status,
         timestamp: new Date().toISOString()
       });
@@ -64,6 +75,58 @@ async function deleteSaleItem(req, res) {
       success: false,
       error: 'Error eliminando item',
     });
+  }
+}
+
+/**
+ * PATCH /api/sales/:saleId/items/:itemId/status
+ * Actualizar estado de preparación de un item
+ */
+async function updateItemStatus(req, res) {
+  try {
+    const { saleId, itemId } = req.params;
+    const { status } = req.body;
+
+    if (!['pending', 'preparing', 'ready', 'delivered'].includes(status)) {
+      return res.status(400).json({ success: false, error: 'Estado inválido' });
+    }
+
+    // 1. Actualizar estado
+    const result = await query(
+      'UPDATE sale_items SET preparation_status = ? WHERE id = ? AND sale_id = ?',
+      [status, itemId, saleId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, error: 'Item no encontrado' });
+    }
+
+    // 2. Obtener info para socket
+    const itemData = await query(
+      `SELECT si.product_name, s.table_id 
+       FROM sale_items si
+       JOIN sales s ON si.sale_id = s.id
+       WHERE si.id = ?`,
+      [itemId]
+    );
+
+    if (itemData.length > 0) {
+      const { product_name, table_id } = itemData[0];
+      
+      // 3. Emitir evento de cocina
+      socketEvents.emitKitchenUpdate({
+        saleId,
+        itemId,
+        status,
+        tableId: table_id,
+        productName: product_name
+      });
+    }
+
+    res.json({ success: true, status });
+  } catch (error) {
+    console.error('Error actualizando estado de item:', error);
+    res.status(500).json({ success: false, error: 'Error interno' });
   }
 }
 
@@ -125,4 +188,5 @@ async function cancelSale(req, res) {
 module.exports = {
   deleteSaleItem,
   cancelSale,
+  updateItemStatus,
 };

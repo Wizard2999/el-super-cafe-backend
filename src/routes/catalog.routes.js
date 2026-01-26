@@ -2,26 +2,26 @@ const express = require('express');
 const router = express.Router();
 
 const catalogController = require('../controllers/catalog.controller');
-const { verifyToken, requireAdmin } = require('../middleware/auth.middleware');
+const { verifyToken, requireAdmin, requireInventoryAccess } = require('../middleware/auth.middleware');
 
 // Catálogo completo
 router.get('/full', verifyToken, catalogController.getFullCatalog);
-router.post('/sync', verifyToken, requireAdmin, catalogController.syncCatalog);
+router.post('/sync', verifyToken, requireInventoryAccess, catalogController.syncCatalog);
 
 // Categorías
 router.get('/categories', verifyToken, catalogController.getCategories);
-router.post('/categories', verifyToken, requireAdmin, catalogController.upsertCategory);
-router.delete('/categories/:id', verifyToken, requireAdmin, catalogController.deleteCategory);
+router.post('/categories', verifyToken, requireInventoryAccess, catalogController.upsertCategory);
+router.delete('/categories/:id', verifyToken, requireInventoryAccess, catalogController.deleteCategory);
 
 // Productos
 router.get('/products', verifyToken, catalogController.getProducts);
-router.post('/products', verifyToken, requireAdmin, catalogController.upsertProduct);
-router.delete('/products/:id', verifyToken, requireAdmin, catalogController.deleteProduct);
+router.post('/products', verifyToken, requireInventoryAccess, catalogController.upsertProduct);
+router.delete('/products/:id', verifyToken, requireInventoryAccess, catalogController.deleteProduct);
 
 // Recetas
 router.get('/recipes', verifyToken, catalogController.getRecipes);
-router.post('/recipes', verifyToken, requireAdmin, catalogController.upsertRecipe);
-router.delete('/recipes/:id', verifyToken, requireAdmin, catalogController.deleteRecipe);
+router.post('/recipes', verifyToken, requireInventoryAccess, catalogController.upsertRecipe);
+router.delete('/recipes/:id', verifyToken, requireInventoryAccess, catalogController.deleteRecipe);
 
 // Mesas
 router.get('/tables', verifyToken, catalogController.getTables);

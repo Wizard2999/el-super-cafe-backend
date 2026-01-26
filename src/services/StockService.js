@@ -12,6 +12,41 @@
 const { query } = require('../config/database');
 
 /**
+ * Calcula el multiplicador de cantidad basado en modificadores
+ * @param {Array|string} modifiers - Modificadores del item
+ * @param {string} ingredientId - ID del ingrediente
+ * @returns {number} Multiplicador (0 = excluido, 1 = normal, 2 = extra)
+ */
+function getModifierMultiplier(modifiers, ingredientId) {
+  if (!modifiers) return 1;
+  
+  let parsedModifiers = modifiers;
+  if (typeof modifiers === 'string') {
+    try {
+      parsedModifiers = JSON.parse(modifiers);
+    } catch (e) {
+      return 1;
+    }
+  }
+  
+  if (!Array.isArray(parsedModifiers)) return 1;
+  
+  const modifier = parsedModifiers.find(m => m.ingredient_id === ingredientId);
+  
+  if (!modifier) return 1;
+  
+  if (modifier.type === 'excluded') return 0;
+  if (modifier.type === 'extra') {
+      // Original (1) + Extra Count (N)
+      // Example: extra_count = 1 => 1 (base) + 1 (extra) = 2
+      const extraCount = Number(modifier.extra_count) || 1;
+      return 1 + extraCount; 
+  }
+  
+  return 1;
+}
+
+/**
  * Resultado de validación de stock
  * @typedef {Object} StockValidationResult
  * @property {boolean} isValid - Si hay stock suficiente
@@ -63,7 +98,11 @@ async function validateStockForItems(items) {
       );
 
       for (const recipe of recipes) {
-        const requiredQty = recipe.quantity_required * quantity;
+        const quantityMultiplier = getModifierMultiplier(item.modifiers, recipe.ingredient_id);
+        
+        if (quantityMultiplier === 0) continue;
+
+        const requiredQty = Number(recipe.quantity_required) * quantity * quantityMultiplier;
         const existing = ingredientRequirements.get(recipe.ingredient_id);
 
         if (existing) {
@@ -82,7 +121,7 @@ async function validateStockForItems(items) {
   // Validar todos los ingredientes acumulados
   for (const [ingredientId, requirement] of ingredientRequirements) {
     const ingredients = await query(
-      'SELECT id, name, manage_stock, stock_current, unit FROM products WHERE id = ?',
+      'SELECT id, name, manage_stock, stock_current, unit, yield_per_unit FROM products WHERE id = ?',
       [ingredientId]
     );
 
@@ -96,13 +135,26 @@ async function validateStockForItems(items) {
     // Solo validar si el ingrediente tiene control de stock
     if (ingredient.manage_stock !== 1) continue;
 
-    if (ingredient.stock_current < requirement.quantity) {
+    // Calcular requerimiento en unidades de stock (considerando rendimiento/porciones)
+    const yieldPerUnit = Number(ingredient.yield_per_unit) || 1;
+    const requiredInStockUnits = (yieldPerUnit > 1) 
+      ? requirement.quantity / yieldPerUnit 
+      : requirement.quantity;
+
+    if (Number(ingredient.stock_current) < requiredInStockUnits) {
+      // Para el mensaje de error, mostrar en porciones si aplica
+      const requiredDisplay = (yieldPerUnit > 1) ? requirement.quantity : requiredInStockUnits;
+      const availableDisplay = (yieldPerUnit > 1) 
+        ? Math.floor(Number(ingredient.stock_current) * yieldPerUnit) 
+        : Number(ingredient.stock_current);
+      const unitDisplay = (yieldPerUnit > 1) ? 'porciones' : (ingredient.unit || 'unid');
+
       errors.push({
         productName: Array.from(requirement.productNames).join(', '),
         ingredientName: ingredient.name,
-        required: requirement.quantity,
-        available: ingredient.stock_current,
-        unit: ingredient.unit || 'unid',
+        required: Number(requiredDisplay.toFixed(2)),
+        available: Number(availableDisplay.toFixed(2)),
+        unit: unitDisplay,
       });
     }
   }
@@ -138,7 +190,7 @@ async function deductStockForItems(conn, items) {
 
     if (product.manage_stock === 1) {
       // Producto con stock directo - descontar
-      const previousStock = product.stock_current;
+      const previousStock = Number(product.stock_current);
       const newStock = Math.max(0, previousStock - quantity);
 
       await conn.execute(
@@ -150,10 +202,14 @@ async function deductStockForItems(conn, items) {
       );
 
       console.log(
-        `[StockService] Descontado ${quantity} de "${product.name}": ${previousStock} → ${newStock}`
+        `[StockService] Descontado ${quantity} de "${product.name}": ${previousStock.toFixed(4)} -> ${newStock.toFixed(4)}`
       );
     } else {
       // Producto con receta - descontar ingredientes
+      // VERIFICACIÓN DE INTEGRIDAD: (Base * Cantidad) + (Extras * Cantidad)
+      // La fórmula usada es: Cantidad * Requerido * (1 + ExtraCount)
+      // Esto es matemáticamente equivalente a: (Cantidad * Requerido) + (Cantidad * Requerido * ExtraCount)
+      // Donde (Cantidad * Requerido) es la Base y (Cantidad * Requerido * ExtraCount) son los Extras.
       const [recipes] = await conn.execute(
         'SELECT ingredient_id, quantity_required FROM recipes WHERE product_id = ?',
         [product_id]
@@ -161,28 +217,40 @@ async function deductStockForItems(conn, items) {
 
       for (const recipe of recipes) {
         const { ingredient_id, quantity_required } = recipe;
-        const totalToDeduct = quantity * quantity_required;
+        
+        const quantityMultiplier = getModifierMultiplier(item.modifiers, ingredient_id);
+        
+        if (quantityMultiplier === 0) continue;
+
+        const totalToDeduct = quantity * Number(quantity_required) * quantityMultiplier;
 
         // Obtener info del ingrediente
         const [ingredientInfo] = await conn.execute(
-          'SELECT name, stock_current FROM products WHERE id = ?',
+          'SELECT name, stock_current, yield_per_unit FROM products WHERE id = ?',
           [ingredient_id]
         );
 
         if (ingredientInfo.length > 0) {
-          const previousStock = ingredientInfo[0].stock_current;
-          const newStock = Math.max(0, previousStock - totalToDeduct);
+          const previousStock = Number(ingredientInfo[0].stock_current);
+          
+          // Calcular descuento en unidades de stock (considerando rendimiento)
+          const yieldPerUnit = Number(ingredientInfo[0].yield_per_unit) || 1;
+          const deductionInStockUnits = (yieldPerUnit > 1) 
+            ? totalToDeduct / yieldPerUnit 
+            : totalToDeduct;
+          
+          const newStock = Math.max(0, previousStock - deductionInStockUnits);
 
           await conn.execute(
             `UPDATE products
              SET stock_current = GREATEST(0, stock_current - ?),
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?`,
-            [totalToDeduct, ingredient_id]
+            [deductionInStockUnits, ingredient_id]
           );
 
           console.log(
-            `[StockService] Descontado ${totalToDeduct} de "${ingredientInfo[0].name}": ${previousStock} → ${newStock}`
+            `[StockService] Descontado ${deductionInStockUnits.toFixed(4)} (${totalToDeduct} porciones) de "${ingredientInfo[0].name}": ${previousStock.toFixed(4)} -> ${newStock.toFixed(4)}`
           );
         }
       }
@@ -238,4 +306,5 @@ module.exports = {
   deductStockForItems,
   validateAndDeductStock,
   formatValidationErrors,
+  getModifierMultiplier,
 };

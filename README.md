@@ -7,6 +7,15 @@ Backend Node.js + Express + MySQL para el sistema POS de El Super Café.
 - Node.js >= 18.0.0
 - MySQL >= 8.0
 
+## Características Backend
+
+- **API RESTful:** Endpoints para gestión de ventas, productos, inventario y usuarios.
+- **Soporte de Modificadores:** Procesamiento de pedidos con ingredientes excluidos/extras en `sale_items`.
+- **Cálculo de Totales:** Lógica robusta para calcular totales de venta incluyendo costos de extras.
+- **Gestión de Stock:** Descuento automático de inventario basado en recetas y modificadores (ej. "Extra Queso" descuenta doble).
+- **Sincronización:** Endpoints optimizados para sincronización masiva con clientes offline.
+- **WebSockets:** Notificaciones en tiempo real para actualizaciones de mesas y pedidos.
+
 ## Instalación
 
 1. **Clonar/Copiar el proyecto**
@@ -71,6 +80,12 @@ npm start
 | POST | `/api/sync/sales` | Sincronizar ventas |
 | POST | `/api/sync/movements` | Sincronizar movimientos |
 | GET | `/api/sync/status` | Estado de sincronización |
+
+### KDS (Cocina)
+
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| PATCH | `/api/sales/:saleId/items/:itemId/status` | Actualizar estado de preparación (pending/preparing/ready) |
 
 ### Usuarios (Solo Admin)
 

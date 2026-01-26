@@ -100,6 +100,19 @@ function emitTableCleaned({ tableId }) {
 }
 
 /**
+ * Emite cuando se actualiza el estado de preparación de un ítem (KDS)
+ * @param {object} params
+ * @param {string} params.saleId - ID de la venta
+ * @param {string} params.itemId - ID del ítem
+ * @param {string} params.status - Nuevo estado
+ * @param {string} params.tableId - ID de la mesa
+ * @param {string} params.productName - Nombre del producto
+ */
+function emitKitchenUpdate({ saleId, itemId, status, tableId, productName }) {
+  broadcast('kitchen:update', { saleId, itemId, status, tableId, productName });
+}
+
+/**
  * Emite cuando se crea un nuevo movimiento (gasto/ingreso)
  * @param {object} params
  * @param {string} params.movementId - ID del movimiento
@@ -197,8 +210,10 @@ module.exports = {
   emitSaleComplete,
   emitTableStatusChange,
   emitTableCleaned,
+  emitKitchenUpdate,
   emitMovementCreate,
   emitCatalogUpdate,
+  emitKitchenUpdate,
   emitShiftChange,
   requestFullSync,
   emitWriteError,

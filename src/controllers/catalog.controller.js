@@ -130,7 +130,7 @@ async function deleteCategory(req, res) {
 async function getProducts(req, res) {
   try {
     const products = await query(
-      `SELECT id, name, category_id, price, manage_stock, stock_current, unit
+      `SELECT id, name, category_id, price, cost_unit, manage_stock, stock_current, unit, yield_per_unit, portion_name
        FROM products
        ORDER BY name ASC`
     );
@@ -155,7 +155,7 @@ async function getProducts(req, res) {
  */
 async function upsertProduct(req, res) {
   try {
-    const { id, name, category_id, price, manage_stock, stock_current, unit } = req.body;
+    const { id, name, category_id, price, cost_unit, manage_stock, stock_current, unit, yield_per_unit, portion_name } = req.body;
 
     if (!id || !name || !category_id) {
       return res.status(400).json({
@@ -174,15 +174,18 @@ async function upsertProduct(req, res) {
     const previousName = existing.length > 0 ? existing[0].name : name;
 
     await query(
-      `INSERT INTO products (id, name, category_id, price, manage_stock, stock_current, unit, is_synced)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+      `INSERT INTO products (id, name, category_id, price, cost_unit, manage_stock, stock_current, unit, yield_per_unit, portion_name, is_synced)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
        ON DUPLICATE KEY UPDATE
          name = VALUES(name),
          category_id = VALUES(category_id),
          price = VALUES(price),
+         cost_unit = VALUES(cost_unit),
          manage_stock = VALUES(manage_stock),
          stock_current = VALUES(stock_current),
          unit = VALUES(unit),
+         yield_per_unit = VALUES(yield_per_unit),
+         portion_name = VALUES(portion_name),
          is_synced = 1,
          updated_at = CURRENT_TIMESTAMP`,
       [
@@ -190,9 +193,12 @@ async function upsertProduct(req, res) {
         name,
         category_id,
         price || 0,
+        cost_unit || 0,
         manage_stock ? 1 : 0,
         stock_current || 0,
         unit || 'unid',
+        yield_per_unit || null,
+        portion_name || null
       ]
     );
 
@@ -206,9 +212,12 @@ async function upsertProduct(req, res) {
         name,
         category_id,
         price: price || 0,
+        cost_unit: cost_unit || 0,
         manage_stock: manage_stock ? 1 : 0,
         stock_current: stock_current || 0,
         unit: unit || 'unid',
+        yield_per_unit: yield_per_unit || null,
+        portion_name: portion_name || null
       },
     });
 
@@ -662,7 +671,7 @@ async function getFullCatalog(req, res) {
   try {
     const [categories, products, recipes, tables] = await Promise.all([
       query('SELECT id, name, color FROM categories ORDER BY name ASC'),
-      query('SELECT id, name, category_id, price, manage_stock, stock_current, unit FROM products ORDER BY name ASC'),
+      query('SELECT id, name, category_id, price, manage_stock, stock_current, unit, yield_per_unit, portion_name FROM products ORDER BY name ASC'),
       query('SELECT id, product_id, ingredient_id, quantity_required FROM recipes ORDER BY product_id ASC'),
       query('SELECT id, name, status FROM cafe_tables ORDER BY name ASC'),
     ]);
@@ -721,18 +730,32 @@ async function syncCatalog(req, res) {
     for (const prod of products) {
       try {
         await query(
-          `INSERT INTO products (id, name, category_id, price, manage_stock, stock_current, unit, is_synced)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+          `INSERT INTO products (id, name, category_id, price, cost_unit, manage_stock, stock_current, unit, yield_per_unit, portion_name, is_synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
            ON DUPLICATE KEY UPDATE
              name = VALUES(name),
              category_id = VALUES(category_id),
              price = VALUES(price),
+             cost_unit = VALUES(cost_unit),
              manage_stock = VALUES(manage_stock),
              stock_current = VALUES(stock_current),
              unit = VALUES(unit),
+             yield_per_unit = VALUES(yield_per_unit),
+             portion_name = VALUES(portion_name),
              is_synced = 1,
              updated_at = CURRENT_TIMESTAMP`,
-          [prod.id, prod.name, prod.category_id, prod.price || 0, prod.manage_stock ? 1 : 0, prod.stock_current || 0, prod.unit || 'unid']
+          [
+            prod.id,
+            prod.name,
+            prod.category_id,
+            prod.price || 0,
+            prod.cost_unit || 0,
+            prod.manage_stock ? 1 : 0,
+            prod.stock_current || 0,
+            prod.unit || 'unid',
+            prod.yield_per_unit || null,
+            prod.portion_name || null
+          ]
         );
         results.products.synced++;
       } catch (error) {

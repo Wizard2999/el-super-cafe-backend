@@ -2,6 +2,7 @@ const { query, transaction } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const socketEvents = require('../services/socketEvents');
 const StockService = require('../services/StockService');
+const { safePrice, calculateItemTotal, calculateOrderTotal, calculateSaleCost, calculateGrossProfit } = require('../utils/math');
 
 /**
  * Emitir evento order:update con items incluidos
@@ -10,14 +11,27 @@ const StockService = require('../services/StockService');
 async function emitOrderUpdateWithItems(saleId, tableId) {
   try {
     const saleItems = await query(
-      'SELECT id, sale_id, product_id, product_name, quantity, unit_price FROM sale_items WHERE sale_id = ?',
+      'SELECT id, sale_id, product_id, product_name, quantity, unit_price, modifiers FROM sale_items WHERE sale_id = ?',
       [saleId]
     );
+
+    // Parse modifiers if needed
+    const itemsToSend = saleItems.map(item => {
+      let modifiers = item.modifiers;
+      if (typeof modifiers === 'string') {
+        try {
+          modifiers = JSON.parse(modifiers);
+        } catch (e) {
+          modifiers = [];
+        }
+      }
+      return { ...item, modifiers };
+    });
 
     socketEvents.emitOrderUpdate({
       tableId,
       saleId,
-      items: saleItems,
+      items: itemsToSend,
       status: 'pending',
     });
   } catch (error) {
@@ -123,16 +137,37 @@ async function syncFromDevice(req, res) {
         }
 
         // 3. Recalcular total en sales para asegurar consistencia
-        const [totalResult] = await query(
-          'SELECT SUM(quantity * unit_price) as total FROM sale_items WHERE sale_id = ?',
+        const itemsForCalc = await query(
+          'SELECT product_id, quantity, unit_price, modifiers FROM sale_items WHERE sale_id = ?',
           [saleId]
         );
-        const newTotal = totalResult.total || 0;
-        
-        await query('UPDATE sales SET total = ? WHERE id = ?', [newTotal, saleId]);
-        
-        console.log(`[Sync] Venta ${saleId}: Items reemplazados y total recalculado a ${newTotal}`);
 
+        let newTotal = 0;
+        for (const item of itemsForCalc) {
+          let modifiers = item.modifiers;
+          if (typeof modifiers === 'string') {
+            try {
+              modifiers = JSON.parse(modifiers);
+            } catch (e) {
+              modifiers = [];
+            }
+          }
+          if (!Array.isArray(modifiers)) modifiers = [];
+
+          newTotal += calculateItemTotal(item.unit_price, item.quantity, modifiers);
+        }
+
+        // 4. Calcular costo y utilidad bruta para ventas completadas
+        const saleInfo = await query('SELECT status FROM sales WHERE id = ?', [saleId]);
+        let grossProfit = null;
+
+        if (saleInfo.length > 0 && saleInfo[0].status === 'completed') {
+          const saleCost = await calculateSaleCost(itemsForCalc, query);
+          grossProfit = calculateGrossProfit(newTotal, saleCost);
+        }
+
+        await query('UPDATE sales SET total = ?, gross_profit = ? WHERE id = ?', [newTotal, grossProfit, saleId]);
+        
       } catch (error) {
         console.error(`Error sincronizando items para venta ${saleId}:`, error);
         // Marcar error para cada item de esta venta
@@ -390,18 +425,30 @@ async function syncSale(sale) {
 
 /**
  * Sincronizar un item de venta
+ * Incluye preparation_status para persistir estados de cocina
  */
 async function syncSaleItem(item) {
   const sql = `
     INSERT INTO sale_items (
-      id, sale_id, product_id, product_name, quantity, unit_price, is_synced
-    ) VALUES (?, ?, ?, ?, ?, ?, 1)
+      id, sale_id, product_id, product_name, quantity, unit_price, modifiers, preparation_status, is_synced
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
     ON DUPLICATE KEY UPDATE
       quantity = VALUES(quantity),
       unit_price = VALUES(unit_price),
+      modifiers = VALUES(modifiers),
+      preparation_status = COALESCE(VALUES(preparation_status), preparation_status, 'pending'),
       is_synced = 1,
       updated_at = CURRENT_TIMESTAMP
   `;
+
+  // Asegurar que modifiers sea string o null
+  let modifiersValue = item.modifiers;
+  if (modifiersValue && typeof modifiersValue !== 'string') {
+    modifiersValue = JSON.stringify(modifiersValue);
+  }
+
+  // preparation_status por defecto es 'pending' si no viene
+  const preparationStatus = item.preparation_status || 'pending';
 
   await query(sql, [
     item.id,
@@ -410,6 +457,8 @@ async function syncSaleItem(item) {
     item.product_name,
     item.quantity,
     item.unit_price,
+    modifiersValue,
+    preparationStatus,
   ]);
 }
 
@@ -421,7 +470,7 @@ async function syncSaleItem(item) {
 async function processInventoryDeduction(saleId) {
   // Obtener todos los items de la venta
   const saleItems = await query(
-    'SELECT product_id, quantity FROM sale_items WHERE sale_id = ?',
+    'SELECT product_id, quantity, modifiers FROM sale_items WHERE sale_id = ?',
     [saleId]
   );
 
@@ -434,7 +483,7 @@ async function processInventoryDeduction(saleId) {
 
     // Obtener información del producto
     const products = await query(
-      'SELECT id, manage_stock, stock_current FROM products WHERE id = ?',
+      'SELECT id, name, manage_stock, stock_current FROM products WHERE id = ?',
       [product_id]
     );
 
@@ -447,7 +496,7 @@ async function processInventoryDeduction(saleId) {
 
     if (product.manage_stock === 1) {
       // Producto con stock directo: restar cantidad vendida
-      const previousStock = product.stock_current;
+      const previousStock = Number(product.stock_current);
       const newStock = Math.max(0, previousStock - quantity);
 
       await query(
@@ -458,11 +507,14 @@ async function processInventoryDeduction(saleId) {
         [quantity, product_id]
       );
 
+      console.log(
+        `[SyncController] Descontado ${quantity} de "${product.name}": ${previousStock.toFixed(4)} -> ${newStock.toFixed(4)}`
+      );
+
       // Emitir evento de cambio de stock
-      const productInfo = await query('SELECT name FROM products WHERE id = ?', [product_id]);
       socketEvents.emitStockChange({
         productId: product_id,
-        productName: productInfo[0]?.name || 'Producto',
+        productName: product.name,
         previousStock,
         newStock,
         reason: 'sale',
@@ -477,8 +529,14 @@ async function processInventoryDeduction(saleId) {
       for (const recipe of recipes) {
         const { ingredient_id, quantity_required } = recipe;
 
-        // Calcular cantidad total a descontar (cantidad vendida * cantidad por unidad)
-        const totalToDeduct = quantity * quantity_required;
+        // Calcular multiplicador por modificadores
+        const quantityMultiplier = StockService.getModifierMultiplier(item.modifiers, ingredient_id);
+        
+        if (quantityMultiplier === 0) continue;
+
+        // Calcular cantidad total a descontar (cantidad vendida * cantidad por unidad * multiplicador)
+        // Usar Number() para asegurar precisión
+        const totalToDeduct = quantity * Number(quantity_required) * quantityMultiplier;
 
         // Obtener stock actual del insumo
         const ingredientInfo = await query(
@@ -487,7 +545,7 @@ async function processInventoryDeduction(saleId) {
         );
 
         if (ingredientInfo.length > 0) {
-          const previousStock = ingredientInfo[0].stock_current;
+          const previousStock = Number(ingredientInfo[0].stock_current);
           const newStock = Math.max(0, previousStock - totalToDeduct);
 
           // Descontar del insumo
@@ -497,6 +555,10 @@ async function processInventoryDeduction(saleId) {
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?`,
             [totalToDeduct, ingredient_id]
+          );
+
+          console.log(
+            `[SyncController] Descontado ${totalToDeduct.toFixed(4)} de "${ingredientInfo[0].name}": ${previousStock.toFixed(4)} -> ${newStock.toFixed(4)}`
           );
 
           // Emitir evento de cambio de stock del insumo
@@ -1105,17 +1167,34 @@ async function getPendingSales(req, res) {
       ORDER BY s.created_at DESC
     `);
 
-    // Obtener items de todas las ventas pendientes
+    // Obtener items de todas las ventas pendientes (incluir modifiers y preparation_status)
     let saleItems = [];
     if (sales.length > 0) {
       const saleIds = sales.map(s => s.id);
       const placeholders = saleIds.map(() => '?').join(',');
       saleItems = await query(
-        `SELECT id, sale_id, product_id, product_name, quantity, unit_price
+        `SELECT id, sale_id, product_id, product_name, quantity, unit_price, modifiers, preparation_status
          FROM sale_items
          WHERE sale_id IN (${placeholders})`,
         saleIds
       );
+
+      // Parsear modifiers si es string
+      saleItems = saleItems.map(item => {
+        let modifiers = item.modifiers;
+        if (typeof modifiers === 'string') {
+          try {
+            modifiers = JSON.parse(modifiers);
+          } catch (e) {
+            modifiers = [];
+          }
+        }
+        return {
+          ...item,
+          modifiers: modifiers || [],
+          preparation_status: item.preparation_status || 'pending'
+        };
+      });
     }
 
     // Obtener estado actual de mesas ocupadas
@@ -1125,14 +1204,30 @@ async function getPendingSales(req, res) {
       WHERE status = 'occupied'
     `);
 
+    // Agrupar items por sale_id para recalcular totales
+    const itemsBySaleId = {};
+    for (const item of saleItems) {
+      if (!itemsBySaleId[item.sale_id]) {
+        itemsBySaleId[item.sale_id] = [];
+      }
+      itemsBySaleId[item.sale_id].push(item);
+    }
+
+    // Recalcular totales de ventas usando calculateOrderTotal
+    const salesWithCorrectTotals = sales.map(s => {
+      const saleItems = itemsBySaleId[s.id] || [];
+      const recalculatedTotal = calculateOrderTotal(saleItems);
+      return {
+        ...s,
+        total: recalculatedTotal, // Usar total recalculado
+        created_at: s.created_at,
+      };
+    });
+
     res.json({
       success: true,
       data: {
-        sales: sales.map(s => ({
-          ...s,
-          total: parseFloat(s.total),
-          created_at: s.created_at,
-        })),
+        sales: salesWithCorrectTotals,
         sale_items: saleItems.map(item => ({
           ...item,
           unit_price: parseFloat(item.unit_price),

@@ -97,6 +97,48 @@ function requireAdmin(req, res, next) {
 }
 
 /**
+ * Middleware para verificar acceso a inventario (admin o auxiliar_inventario)
+ */
+function requireInventoryAccess(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      error: 'No autenticado',
+    });
+  }
+
+  if (req.user.role !== 'admin' && req.user.role !== 'auxiliar_inventario') {
+    return res.status(403).json({
+      success: false,
+      error: 'Acceso denegado. Se requiere acceso a inventario.',
+    });
+  }
+
+  next();
+}
+
+/**
+ * Middleware para verificar acceso a cocina (admin o kitchen)
+ */
+function requireKitchenAccess(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      error: 'No autenticado',
+    });
+  }
+
+  if (req.user.role !== 'admin' && req.user.role !== 'kitchen') {
+    return res.status(403).json({
+      success: false,
+      error: 'Acceso denegado. Se requiere acceso a cocina.',
+    });
+  }
+
+  next();
+}
+
+/**
  * Genera un token JWT para el usuario
  */
 function generateToken(user) {
@@ -114,5 +156,7 @@ function generateToken(user) {
 module.exports = {
   verifyToken,
   requireAdmin,
+  requireInventoryAccess,
+  requireKitchenAccess,
   generateToken,
 };
