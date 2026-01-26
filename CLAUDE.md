@@ -28,6 +28,9 @@ src/
 │   ├── sync.routes.js
 │   ├── users.routes.js
 │   └── reports.routes.js
+├── services/
+│   ├── socketEvents.js     # Eventos de WebSocket
+│   └── StockService.js     # Validación y descuento de stock
 ├── utils/                  # (Reservado para utilidades)
 └── index.js               # Servidor principal Express
 ```
@@ -124,8 +127,50 @@ El backend es la **Fuente de Verdad** para todos los datos:
 - `DELETE /api/users/:id` - Desactivar/Eliminar usuario (Admin only)
 - `GET /api/users` - Listar usuarios (Admin only)
 
+### Validación de Stock (StockService.js)
+Antes de procesar una venta `completed`, el sistema valida que haya stock suficiente.
+
+#### Flujo de Validación
+1. Cuando llega una venta con `status: 'completed'` (nueva o que cambia a completed):
+   - Se valida stock ANTES de guardar la venta
+   - Si no hay stock suficiente, se retorna **HTTP 400** con detalle del error
+   - La venta NO se registra en la base de datos
+
+2. Si la validación pasa:
+   - Se usa una **transacción SQL** para:
+     - Crear/actualizar la venta
+     - Crear los items
+     - Descontar el stock
+   - Si algo falla, todo se revierte (rollback)
+
+#### Respuesta de Error 400 (Stock Insuficiente)
+```json
+{
+  "success": false,
+  "error": "Stock insuficiente:\nLeche: necesitas 500 ml, solo hay 200 ml",
+  "stockErrors": [
+    {
+      "productName": "Café con Leche",
+      "ingredientName": "Leche",
+      "required": 500,
+      "available": 200,
+      "unit": "ml"
+    }
+  ],
+  "saleId": "uuid-de-la-venta"
+}
+```
+
+#### Funciones del StockService
+| Función | Descripción |
+|---------|-------------|
+| `validateStockForItems(items)` | Valida si hay stock suficiente |
+| `deductStockForItems(conn, items)` | Descuenta stock (dentro de transacción) |
+| `validateAndDeductStock(conn, items)` | Valida y descuenta en una operación |
+| `formatValidationErrors(errors)` | Formatea errores para respuesta HTTP |
+
 ### Descuento Automático de Inventario
-Cuando se sincroniza una venta **nueva** con `status: 'completed'`, el sistema ejecuta automáticamente `processInventoryDeduction(saleId)`:
+Cuando se sincroniza una venta **nueva** con `status: 'completed'`, el sistema valida stock y ejecuta el descuento dentro de una transacción SQL:
 
 #### Lógica de Descuento
 1. **Productos con stock directo** (`manage_stock = 1`):

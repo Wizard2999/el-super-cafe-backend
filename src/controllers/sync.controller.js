@@ -1,6 +1,7 @@
 const { query, transaction } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const socketEvents = require('../services/socketEvents');
+const StockService = require('../services/StockService');
 
 /**
  * Emitir evento order:update con items incluidos
@@ -548,7 +549,10 @@ async function logSync(deviceId, syncType, results) {
 
 /**
  * POST /api/sync/sales
- * Sincronizar solo ventas
+ * Sincronizar ventas con validación de stock
+ *
+ * IMPORTANTE: Si una venta es nueva y status='completed', se valida stock ANTES de guardar.
+ * Si no hay stock suficiente, se retorna error 400 y la venta NO se registra.
  */
 async function syncSales(req, res) {
   const deviceId = req.headers['x-device-id'] || 'unknown';
@@ -562,52 +566,172 @@ async function syncSales(req, res) {
       inventory: { processed: 0, errors: [] },
     };
 
-    // Sincronizar ventas y rastrear las que necesitan descuento de inventario
-    const salesNeedingInventoryDeduction = [];
+    // Agrupar items por sale_id para validación
+    const itemsBySaleId = new Map();
+    for (const item of sale_items) {
+      if (!itemsBySaleId.has(item.sale_id)) {
+        itemsBySaleId.set(item.sale_id, []);
+      }
+      itemsBySaleId.get(item.sale_id).push(item);
+    }
+
+    // Procesar cada venta
     for (const sale of sales) {
       try {
-        const needsInventoryDeduction = await syncSale(sale);
-        results.sales.synced++;
-        if (needsInventoryDeduction) {
-          salesNeedingInventoryDeduction.push(sale.id);
+        // Verificar si la venta ya existe
+        const existing = await query('SELECT id, status FROM sales WHERE id = ?', [sale.id]);
+        const isNew = existing.length === 0;
+        const previousStatus = existing.length > 0 ? existing[0].status : null;
+
+        // Determinar si necesita validación de stock:
+        // - Venta nueva con status completed
+        // - O venta existente que cambia a completed por primera vez
+        const needsStockValidation =
+          (isNew && sale.status === 'completed') ||
+          (!isNew && previousStatus !== 'completed' && sale.status === 'completed');
+
+        const saleItems = itemsBySaleId.get(sale.id) || [];
+
+        if (needsStockValidation && saleItems.length > 0) {
+          // === VALIDACIÓN DE STOCK ANTES DE PROCESAR ===
+          const stockValidation = await StockService.validateStockForItems(saleItems);
+
+          if (!stockValidation.isValid) {
+            // Stock insuficiente - retornar error 400 inmediatamente
+            const errorMessage = StockService.formatValidationErrors(stockValidation.errors);
+            console.warn(`[syncSales] Stock insuficiente para venta ${sale.id}:`, errorMessage);
+
+            return res.status(400).json({
+              success: false,
+              error: errorMessage,
+              stockErrors: stockValidation.errors,
+              saleId: sale.id,
+            });
+          }
+
+          // === TRANSACCIÓN: Crear venta + items + descontar stock atómicamente ===
+          await transaction(async (conn) => {
+            // 1. Crear/actualizar la venta
+            await conn.execute(
+              `INSERT INTO sales (
+                id, total, payment_method, status, observation,
+                unpaid_authorized_by_id, shift_id, table_id, print_count,
+                is_synced, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+              ON DUPLICATE KEY UPDATE
+                total = VALUES(total),
+                payment_method = VALUES(payment_method),
+                status = VALUES(status),
+                observation = VALUES(observation),
+                unpaid_authorized_by_id = VALUES(unpaid_authorized_by_id),
+                print_count = VALUES(print_count),
+                is_synced = 1,
+                updated_at = CURRENT_TIMESTAMP`,
+              [
+                sale.id,
+                sale.total,
+                sale.payment_method,
+                sale.status,
+                sale.observation || null,
+                sale.unpaid_authorized_by_id || null,
+                sale.shift_id || null,
+                sale.table_id || null,
+                sale.print_count || 0,
+                new Date(sale.created_at),
+              ]
+            );
+
+            // 2. Crear items de la venta
+            for (const item of saleItems) {
+              await conn.execute(
+                `INSERT INTO sale_items (
+                  id, sale_id, product_id, product_name, quantity, unit_price, is_synced
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON DUPLICATE KEY UPDATE
+                  quantity = VALUES(quantity),
+                  unit_price = VALUES(unit_price),
+                  is_synced = 1,
+                  updated_at = CURRENT_TIMESTAMP`,
+                [item.id, item.sale_id, item.product_id, item.product_name, item.quantity, item.unit_price]
+              );
+            }
+
+            // 3. Descontar stock dentro de la misma transacción
+            await StockService.deductStockForItems(conn, saleItems);
+
+            // 4. Liberar mesa si aplica
+            if (sale.table_id) {
+              await conn.execute(
+                `UPDATE cafe_tables SET status = 'free', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [sale.table_id]
+              );
+            }
+          });
+
+          results.sales.synced++;
+          results.inventory.processed++;
+
+          // Emitir eventos de socket
+          socketEvents.emitSaleComplete({
+            saleId: sale.id,
+            tableId: sale.table_id,
+            total: sale.total,
+            paymentMethod: sale.payment_method,
+            status: sale.status,
+          });
+
+          if (sale.table_id) {
+            const tableInfo = await query('SELECT name FROM cafe_tables WHERE id = ?', [sale.table_id]);
+            socketEvents.emitTableStatusChange({
+              tableId: sale.table_id,
+              tableName: tableInfo[0]?.name || 'Mesa',
+              status: 'free',
+            });
+          }
+
+          // Marcar items como sincronizados en results
+          results.sale_items.synced += saleItems.length;
+        } else {
+          // Venta pendiente o sin cambio a completed - procesar normalmente (sin validación de stock)
+          const needsInventoryDeduction = await syncSale(sale);
+          results.sales.synced++;
+
+          // Sincronizar items de esta venta
+          for (const item of saleItems) {
+            try {
+              await syncSaleItem(item);
+              results.sale_items.synced++;
+            } catch (error) {
+              results.sale_items.errors.push({
+                id: item.id,
+                error: error.message,
+              });
+            }
+          }
+
+          // Emitir order:update para ventas pendientes
+          if (sale.status === 'pending' && sale.table_id) {
+            await emitOrderUpdateWithItems(sale.id, sale.table_id);
+          }
+
+          // Procesar descuento de inventario si es necesario (para compatibilidad con flujo anterior)
+          if (needsInventoryDeduction) {
+            try {
+              await processInventoryDeduction(sale.id);
+              results.inventory.processed++;
+            } catch (error) {
+              console.error(`Error procesando inventario para venta ${sale.id}:`, error);
+              results.inventory.errors.push({
+                saleId: sale.id,
+                error: error.message,
+              });
+            }
+          }
         }
       } catch (error) {
+        console.error(`Error sincronizando venta ${sale.id}:`, error);
         results.sales.errors.push({
           id: sale.id,
-          error: error.message,
-        });
-      }
-    }
-
-    // Sincronizar items
-    for (const item of sale_items) {
-      try {
-        await syncSaleItem(item);
-        results.sale_items.synced++;
-      } catch (error) {
-        results.sale_items.errors.push({
-          id: item.id,
-          error: error.message,
-        });
-      }
-    }
-
-    // Emitir eventos de order:update para ventas pendientes DESPUÉS de que los items estén sincronizados
-    for (const sale of sales) {
-      if (sale.status === 'pending' && sale.table_id) {
-        await emitOrderUpdateWithItems(sale.id, sale.table_id);
-      }
-    }
-
-    // Procesar descuento de inventario para ventas que lo necesitan
-    for (const saleId of salesNeedingInventoryDeduction) {
-      try {
-        await processInventoryDeduction(saleId);
-        results.inventory.processed++;
-      } catch (error) {
-        console.error(`Error procesando inventario para venta ${saleId}:`, error);
-        results.inventory.errors.push({
-          saleId,
           error: error.message,
         });
       }
