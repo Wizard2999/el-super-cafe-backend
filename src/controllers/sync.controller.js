@@ -430,13 +430,14 @@ async function syncSale(sale) {
 async function syncSaleItem(item) {
   const sql = `
     INSERT INTO sale_items (
-      id, sale_id, product_id, product_name, quantity, unit_price, modifiers, preparation_status, is_synced
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+      id, sale_id, product_id, product_name, quantity, unit_price, modifiers, preparation_status, observations, is_synced
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
     ON DUPLICATE KEY UPDATE
       quantity = VALUES(quantity),
       unit_price = VALUES(unit_price),
       modifiers = VALUES(modifiers),
       preparation_status = COALESCE(VALUES(preparation_status), preparation_status, 'pending'),
+      observations = VALUES(observations),
       is_synced = 1,
       updated_at = CURRENT_TIMESTAMP
   `;
@@ -459,6 +460,7 @@ async function syncSaleItem(item) {
     item.unit_price,
     modifiersValue,
     preparationStatus,
+    item.observations || null,
   ]);
 }
 
@@ -540,25 +542,32 @@ async function processInventoryDeduction(saleId) {
 
         // Obtener stock actual del insumo
         const ingredientInfo = await query(
-          'SELECT name, stock_current FROM products WHERE id = ?',
+          'SELECT name, stock_current, yield_per_unit FROM products WHERE id = ?',
           [ingredient_id]
         );
 
         if (ingredientInfo.length > 0) {
           const previousStock = Number(ingredientInfo[0].stock_current);
-          const newStock = Math.max(0, previousStock - totalToDeduct);
+          
+          // Calcular descuento en unidades de stock (considerando rendimiento)
+          const yieldPerUnit = Number(ingredientInfo[0].yield_per_unit) || 1;
+          const deductionInStockUnits = (yieldPerUnit > 1) 
+            ? totalToDeduct / yieldPerUnit 
+            : totalToDeduct;
+
+          const newStock = Math.max(0, previousStock - deductionInStockUnits);
 
           // Descontar del insumo
           await query(
             `UPDATE products
              SET stock_current = GREATEST(0, stock_current - ?),
-                 updated_at = CURRENT_TIMESTAMP
+             updated_at = CURRENT_TIMESTAMP
              WHERE id = ?`,
-            [totalToDeduct, ingredient_id]
+            [deductionInStockUnits, ingredient_id]
           );
 
           console.log(
-            `[SyncController] Descontado ${totalToDeduct.toFixed(4)} de "${ingredientInfo[0].name}": ${previousStock.toFixed(4)} -> ${newStock.toFixed(4)}`
+            `[SyncController] Descontado ${deductionInStockUnits.toFixed(4)} (${totalToDeduct} porciones) de "${ingredientInfo[0].name}": ${previousStock.toFixed(4)} -> ${newStock.toFixed(4)}`
           );
 
           // Emitir evento de cambio de stock del insumo
@@ -740,16 +749,27 @@ async function syncSales(req, res) {
             await conn.execute('DELETE FROM sale_items WHERE sale_id = ?', [sale.id]);
 
             for (const item of saleItems) {
+              // Normalizar campos opcionales
+              let modifiersValue = item.modifiers;
+              if (modifiersValue && typeof modifiersValue !== 'string') {
+                try { modifiersValue = JSON.stringify(modifiersValue); } catch { modifiersValue = null; }
+              }
+              const preparationStatus = item.preparation_status || 'pending';
+              const observations = item.observations || null;
+
               await conn.execute(
                 `INSERT INTO sale_items (
-                  id, sale_id, product_id, product_name, quantity, unit_price, is_synced
-                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                  id, sale_id, product_id, product_name, quantity, unit_price, modifiers, preparation_status, observations, is_synced
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ON DUPLICATE KEY UPDATE
                   quantity = VALUES(quantity),
                   unit_price = VALUES(unit_price),
+                  modifiers = VALUES(modifiers),
+                  preparation_status = COALESCE(VALUES(preparation_status), preparation_status, 'pending'),
+                  observations = VALUES(observations),
                   is_synced = 1,
                   updated_at = CURRENT_TIMESTAMP`,
-                [item.id, item.sale_id, item.product_id, item.product_name, item.quantity, item.unit_price]
+                [item.id, item.sale_id, item.product_id, item.product_name, item.quantity, item.unit_price, modifiersValue, preparationStatus, observations]
               );
             }
 
@@ -1518,33 +1538,61 @@ async function transferTablesToUser(req, res) {
       });
     }
 
-    // Update sales: set shift_id = NULL and pending_receiver_user_id = receiver_user_id
-    await query(
-      `UPDATE sales
-       SET shift_id = NULL,
-           pending_receiver_user_id = ?,
-           is_synced = 1,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id IN (${placeholders})`,
-      [receiver_user_id, ...sale_ids]
-    );
+    // Use transaction for atomicity: update sales AND ensure tables stay occupied
+    const updatedSales = await transaction(async (conn) => {
+      // 1. Update sales: shift_id = NULL, pending_receiver_user_id = receiver
+      await conn.execute(
+        `UPDATE sales
+         SET shift_id = NULL,
+             pending_receiver_user_id = ?,
+             is_synced = 1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id IN (${placeholders})`,
+        [receiver_user_id, ...sale_ids]
+      );
 
-    // Get updated sales with table info for socket event
-    const updatedSales = await query(
-      `SELECT s.id, s.table_id, t.name as table_name
-       FROM sales s
-       LEFT JOIN cafe_tables t ON s.table_id = t.id
-       WHERE s.id IN (${placeholders})`,
-      sale_ids
-    );
+      // 2. Ensure cafe_tables.status stays 'occupied' for affected tables
+      const tableIds = sales.filter(s => s.table_id).map(s => s.table_id);
+      if (tableIds.length > 0) {
+        const tablePlaceholders = tableIds.map(() => '?').join(',');
+        await conn.execute(
+          `UPDATE cafe_tables
+           SET status = 'occupied', is_synced = 1, updated_at = CURRENT_TIMESTAMP
+           WHERE id IN (${tablePlaceholders})`,
+          tableIds
+        );
+      }
 
-    // Emit socket event to notify devices about the transfer
+      // 3. Get updated sales with table info
+      const [result] = await conn.execute(
+        `SELECT s.id, s.table_id, t.name as table_name
+         FROM sales s
+         LEFT JOIN cafe_tables t ON s.table_id = t.id
+         WHERE s.id IN (${placeholders})`,
+        sale_ids
+      );
+      return result;
+    });
+
+    // Emit socket events AFTER successful transaction
+    // A) sales:transfer for the new handler
     socketEvents.broadcast('sales:transfer', {
       sale_ids,
       receiver_user_id,
       receiver_name: receiver.name,
       tables: updatedSales.map(s => ({ id: s.table_id, name: s.table_name })),
     });
+
+    // B) table:status_change for each affected table (belt-and-suspenders)
+    for (const sale of updatedSales) {
+      if (sale.table_id) {
+        socketEvents.emitTableStatusChange({
+          tableId: sale.table_id,
+          tableName: sale.table_name || 'Mesa',
+          status: 'occupied',
+        });
+      }
+    }
 
     res.json({
       success: true,
@@ -1590,16 +1638,30 @@ async function linkOrphanSalesToShift(userId, shiftId) {
     const saleIds = orphanSales.map(s => s.id);
     const placeholders = saleIds.map(() => '?').join(',');
 
-    // Link sales to the new shift and clear pending_receiver_user_id
-    await query(
-      `UPDATE sales
-       SET shift_id = ?,
-           pending_receiver_user_id = NULL,
-           is_synced = 1,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id IN (${placeholders})`,
-      [shiftId, ...saleIds]
-    );
+    // Use transaction: link sales AND ensure tables stay occupied
+    await transaction(async (conn) => {
+      // 1. Link sales to the new shift and clear pending_receiver_user_id
+      await conn.execute(
+        `UPDATE sales
+         SET shift_id = ?,
+             pending_receiver_user_id = NULL,
+             is_synced = 1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id IN (${placeholders})`,
+        [shiftId, ...saleIds]
+      );
+
+      // 2. Ensure cafe_tables.status stays 'occupied' for affected tables
+      const tableIds = orphanSales.filter(s => s.table_id).map(s => s.table_id);
+      if (tableIds.length > 0) {
+        const tablePH = tableIds.map(() => '?').join(',');
+        await conn.execute(
+          `UPDATE cafe_tables SET status = 'occupied', is_synced = 1, updated_at = CURRENT_TIMESTAMP
+           WHERE id IN (${tablePH})`,
+          tableIds
+        );
+      }
+    });
 
     console.log(`[Handover] Linked ${saleIds.length} orphan sales to shift ${shiftId}`);
 
@@ -1622,6 +1684,15 @@ async function linkOrphanSalesToShift(userId, shiftId) {
       shift_id: shiftId,
       tables,
     });
+
+    // Also emit table:status_change for each affected table
+    for (const table of tables) {
+      socketEvents.emitTableStatusChange({
+        tableId: table.id,
+        tableName: table.name,
+        status: 'occupied',
+      });
+    }
 
     return { count: saleIds.length, tables };
   } catch (error) {
