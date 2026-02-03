@@ -225,6 +225,10 @@ app.use('/api/tables', tablesRoutes);
 const shiftsRoutes = require('./routes/shifts.routes');
 app.use('/api/shifts', shiftsRoutes);
 
+// Rutas de crédito
+const creditRoutes = require('./routes/credit.routes');
+app.use('/api/credit', creditRoutes);
+
 // ============================================
 // MANEJO DE ERRORES
 // ============================================

@@ -1701,10 +1701,104 @@ async function linkOrphanSalesToShift(userId, shiftId) {
   }
 }
 
+/**
+ * Sync customers from device
+ */
+async function syncCustomers(req, res) {
+  const { customers } = req.body;
+  if (!customers || !Array.isArray(customers)) {
+    return res.status(400).json({ success: false, error: 'Datos inválidos' });
+  }
+
+  try {
+    await transaction(async (conn) => {
+      for (const customer of customers) {
+        await conn.execute(
+          `INSERT INTO customers (
+            id, name, identification, phone, address, email,
+            credit_limit, current_debt, is_active, is_synced, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            name = VALUES(name),
+            identification = VALUES(identification),
+            phone = VALUES(phone),
+            address = VALUES(address),
+            email = VALUES(email),
+            credit_limit = VALUES(credit_limit),
+            current_debt = VALUES(current_debt),
+            is_active = VALUES(is_active),
+            is_synced = 1,
+            updated_at = CURRENT_TIMESTAMP`,
+          [
+            customer.id,
+            customer.name,
+            customer.identification || null,
+            customer.phone || null,
+            customer.address || null,
+            customer.email || null,
+            customer.credit_limit || 0,
+            customer.current_debt || 0,
+            customer.is_active ? 1 : 0,
+            new Date(customer.created_at || Date.now()),
+            new Date(customer.updated_at || Date.now())
+          ]
+        );
+      }
+    });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error syncing customers:', error);
+    res.status(500).json({ success: false, error: 'Error interno' });
+  }
+}
+
+/**
+ * Sync credit transactions from device
+ */
+async function syncCreditTransactions(req, res) {
+  const { transactions } = req.body;
+  if (!transactions || !Array.isArray(transactions)) {
+    return res.status(400).json({ success: false, error: 'Datos inválidos' });
+  }
+
+  try {
+    await transaction(async (conn) => {
+      for (const t of transactions) {
+        await conn.execute(
+          `INSERT INTO credit_transactions (
+            id, customer_id, type, amount, remaining, sale_id,
+            shift_id, description, is_synced, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+          ON DUPLICATE KEY UPDATE
+            remaining = VALUES(remaining),
+            is_synced = 1`,
+          [
+            t.id,
+            t.customer_id,
+            t.type,
+            t.amount,
+            t.remaining || 0,
+            t.sale_id || null,
+            t.shift_id || null,
+            t.description || null,
+            new Date(t.created_at || Date.now())
+          ]
+        );
+      }
+    });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error syncing credit transactions:', error);
+    res.status(500).json({ success: false, error: 'Error interno' });
+  }
+}
+
 module.exports = {
   syncFromDevice,
   syncSales,
   syncMovements,
+  syncCustomers,
+  syncCreditTransactions,
   getSyncStatus,
   syncUsersToDevice,
   processInventoryDeduction,

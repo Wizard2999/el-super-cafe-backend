@@ -6,13 +6,20 @@ const { query } = require('../config/database');
  */
 async function getSalesSummary(req, res) {
   try {
-    const { start_date, end_date, period = 'day' } = req.query;
+    const { start_date, end_date, period = 'day', shift_id } = req.query;
 
     let startDate, endDate;
+    let whereClause = "WHERE status = 'completed'";
+    const params = [];
 
-    if (start_date && end_date) {
+    if (shift_id) {
+      whereClause += " AND shift_id = ?";
+      params.push(shift_id);
+    } else if (start_date && end_date) {
       startDate = new Date(start_date);
       endDate = new Date(end_date);
+      whereClause += " AND created_at BETWEEN ? AND ?";
+      params.push(startDate, endDate);
     } else {
       // Por defecto: hoy
       endDate = new Date();
@@ -31,6 +38,8 @@ async function getSalesSummary(req, res) {
         default:
           startDate.setHours(0, 0, 0, 0);
       }
+      whereClause += " AND created_at BETWEEN ? AND ?";
+      params.push(startDate, endDate);
     }
 
     // Resumen de ventas
@@ -41,20 +50,32 @@ async function getSalesSummary(req, res) {
         COALESCE(SUM(CASE WHEN payment_method = 'transferencia' THEN total ELSE 0 END), 0) AS transfer_sales,
         COALESCE(SUM(total), 0) AS total_sales
        FROM sales
-       WHERE status = 'completed'
-         AND created_at BETWEEN ? AND ?`,
-      [startDate, endDate]
+       ${whereClause}`,
+      params
     );
 
     // Resumen de gastos
+    // Nota: expensesSummary necesita su propio whereClause porque 'movements' tiene 'type'='gasto'
+    // y puede tener shift_id o fechas.
+    let expensesWhere = "WHERE type = 'gasto'";
+    const expensesParams = [];
+    
+    if (shift_id) {
+        expensesWhere += " AND shift_id = ?";
+        expensesParams.push(shift_id);
+    } else {
+        expensesWhere += " AND created_at BETWEEN ? AND ?";
+        // Reutilizamos las fechas calculadas arriba
+        expensesParams.push(startDate, endDate);
+    }
+
     const expensesSummary = await query(
       `SELECT
         COUNT(*) AS total_expenses_count,
         COALESCE(SUM(amount), 0) AS total_expenses
        FROM movements
-       WHERE type = 'gasto'
-         AND created_at BETWEEN ? AND ?`,
-      [startDate, endDate]
+       ${expensesWhere}`,
+      expensesParams
     );
 
     // Deudas pendientes
@@ -66,9 +87,30 @@ async function getSalesSummary(req, res) {
        WHERE status = 'unpaid_debt'`
     );
 
+    // Abonos (Pagos de créditos)
+    let abonosWhere = "WHERE type = 'payment'";
+    const abonosParams = [];
+    if (shift_id) {
+        abonosWhere += " AND shift_id = ?";
+        abonosParams.push(shift_id);
+    } else {
+        abonosWhere += " AND created_at BETWEEN ? AND ?";
+        abonosParams.push(startDate, endDate);
+    }
+
+    const abonosSummary = await query(
+      `SELECT
+        COUNT(*) AS total_payments,
+        COALESCE(SUM(amount), 0) AS total_amount
+       FROM credit_transactions
+       ${abonosWhere}`,
+      abonosParams
+    );
+
     const sales = salesSummary[0];
     const expenses = expensesSummary[0];
     const debts = debtsSummary[0];
+    const abonos = abonosSummary[0];
 
     res.json({
       success: true,
@@ -91,7 +133,12 @@ async function getSalesSummary(req, res) {
           count: parseInt(debts.total_debts),
           total: parseFloat(debts.total_debt_amount),
         },
+        abonos: {
+          count: parseInt(abonos.total_payments),
+          total: parseFloat(abonos.total_amount),
+        },
         netProfit: parseFloat(sales.total_sales) - parseFloat(expenses.total_expenses),
+        cashFlow: parseFloat(sales.cash_sales) + parseFloat(abonos.total_amount) - parseFloat(expenses.total_expenses),
       },
     });
   } catch (error) {
@@ -220,6 +267,8 @@ async function getShiftsHistory(req, res) {
       `SELECT
         s.*,
         (SELECT COALESCE(SUM(sa.total), 0) FROM sales sa WHERE sa.shift_id = s.id AND sa.status = 'completed') AS total_sales,
+        (SELECT COALESCE(SUM(sa.total), 0) FROM sales sa WHERE sa.shift_id = s.id AND sa.status = 'completed' AND sa.payment_method = 'efectivo') AS cash_sales,
+        (SELECT COALESCE(SUM(ct.amount), 0) FROM credit_transactions ct WHERE ct.shift_id = s.id AND ct.type = 'payment') AS total_abonos,
         (SELECT COALESCE(SUM(m.amount), 0) FROM movements m WHERE m.shift_id = s.id AND m.type = 'gasto') AS total_expenses
        FROM shifts s
        ${statusFilter}
@@ -251,7 +300,7 @@ async function getShiftsHistory(req, res) {
         totalSales: parseFloat(s.total_sales),
         totalExpenses: parseFloat(s.total_expenses),
         expectedCash:
-          parseFloat(s.initial_cash) + parseFloat(s.total_sales) - parseFloat(s.total_expenses),
+          parseFloat(s.initial_cash) + parseFloat(s.cash_sales || 0) + parseFloat(s.total_abonos || 0) - parseFloat(s.total_expenses),
       })),
     });
   } catch (error) {
@@ -383,22 +432,230 @@ async function getPendingDebts(req, res) {
        ORDER BY s.created_at DESC`
     );
 
+    // Si no hay deudas, retornar vacío
+    if (debts.length === 0) {
+      return res.json({ success: true, data: [] });
+    }
+
+    // Obtener items de las deudas
+    const debtIds = debts.map(d => d.id);
+    // Necesitamos manejar el array para el IN clause
+    const placeholders = debtIds.map(() => '?').join(',');
+    
+    const items = await query(
+      `SELECT * FROM sale_items WHERE sale_id IN (${placeholders})`,
+      debtIds
+    );
+
+    // Agrupar items por venta
+    const itemsBySale = {};
+    items.forEach(item => {
+      if (!itemsBySale[item.sale_id]) {
+        itemsBySale[item.sale_id] = [];
+      }
+      // Parsear modifiers si es string
+      let modifiers = item.modifiers;
+      if (typeof modifiers === 'string') {
+        try {
+          modifiers = JSON.parse(modifiers);
+        } catch (e) {
+          modifiers = []; // o null
+        }
+      }
+
+      itemsBySale[item.sale_id].push({
+        id: item.id,
+        product_name: item.product_name,
+        quantity: parseFloat(item.quantity),
+        unit_price: parseFloat(item.unit_price),
+        total: parseFloat(item.unit_price) * parseFloat(item.quantity),
+        modifiers: modifiers
+      });
+    });
+
+    const formattedDebts = debts.map((d) => {
+        // Intentar usar items de la BD, si no hay, buscar en el objeto sale (legacy/embedded)
+        let saleItems = itemsBySale[d.id] || [];
+        
+        // Soporte para items embebidos en el campo 'items' de la venta (si existe como JSON en BD)
+        // Nota: En la estructura actual 'sales' no parece tener columna 'items' JSON, pero por si acaso o si se guardó así.
+        // En el frontend vimos que a veces sale.items existe.
+        // Si la columna no existe en MySQL, d.items será undefined.
+        
+        return {
+            ...d, // Incluir todos los campos de la venta
+            id: d.id,
+            total: parseFloat(d.total),
+            observation: d.observation,
+            authorizedBy: d.authorized_by_name,
+            shiftOpenedBy: d.shift_opened_by,
+            createdAt: d.created_at,
+            items: saleItems
+        };
+    });
+
     res.json({
       success: true,
-      data: debts.map((d) => ({
-        id: d.id,
-        total: parseFloat(d.total),
-        observation: d.observation,
-        authorizedBy: d.authorized_by_name,
-        shiftOpenedBy: d.shift_opened_by,
-        createdAt: d.created_at,
-      })),
+      data: formattedDebts,
     });
   } catch (error) {
     console.error('Error obteniendo deudas:', error);
     res.status(500).json({
       success: false,
       error: 'Error obteniendo deudas',
+    });
+  }
+}
+
+/**
+ * GET /api/reports/detailed-sales
+ * Ventas detalladas para Excel
+ */
+async function getDetailedSales(req, res) {
+  try {
+    const { start_date, end_date, shift_id } = req.query;
+    let whereClause = "WHERE s.status = 'completed'";
+    const params = [];
+
+    if (shift_id) {
+      whereClause += ' AND s.shift_id = ?';
+      params.push(shift_id);
+    } else if (start_date && end_date) {
+      whereClause += ' AND s.created_at BETWEEN ? AND ?';
+      params.push(new Date(start_date), new Date(end_date));
+    }
+
+    const results = await query(
+      `SELECT
+        s.id as sale_id,
+        s.created_at,
+        s.payment_method,
+        s.observation as sale_observation,
+        si.product_name,
+        si.quantity,
+        si.unit_price,
+        si.modifiers
+       FROM sale_items si
+       JOIN sales s ON si.sale_id = s.id
+       ${whereClause}
+       ORDER BY s.created_at DESC`,
+      params
+    );
+
+    res.json({
+      success: true,
+      data: results.map((r) => ({
+        saleId: r.sale_id,
+        date: r.created_at,
+        paymentMethod: r.payment_method,
+        observation: r.sale_observation,
+        productName: r.product_name,
+        quantity: parseFloat(r.quantity),
+        unitPrice: parseFloat(r.unit_price),
+        total: parseFloat(r.quantity) * parseFloat(r.unit_price),
+        modifiers: r.modifiers,
+      })),
+    });
+  } catch (error) {
+    console.error('Error obteniendo ventas detalladas:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error obteniendo ventas detalladas',
+    });
+  }
+}
+
+/**
+ * GET /api/reports/low-rotation
+ * Productos con baja rotación
+ */
+async function getLowRotationProducts(req, res) {
+  try {
+    const { limit = 10, start_date, end_date } = req.query;
+    let dateFilter = '';
+    const params = [];
+
+    if (start_date && end_date) {
+      dateFilter = 'AND s.created_at BETWEEN ? AND ?';
+      params.push(new Date(start_date), new Date(end_date));
+    }
+
+    params.push(parseInt(limit));
+
+    const results = await query(
+      `SELECT
+        p.id,
+        p.name,
+        COALESCE(SUM(si.quantity), 0) as total_quantity
+       FROM products p
+       LEFT JOIN sale_items si ON p.id = si.product_id
+       LEFT JOIN sales s ON si.sale_id = s.id AND s.status = 'completed' ${dateFilter}
+       GROUP BY p.id, p.name
+       ORDER BY total_quantity ASC
+       LIMIT ?`,
+      params
+    );
+
+    res.json({
+      success: true,
+      data: results.map((r) => ({
+        id: r.id,
+        name: r.name,
+        quantity: parseFloat(r.total_quantity),
+      })),
+    });
+  } catch (error) {
+    console.error('Error obteniendo productos baja rotación:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error obteniendo productos baja rotación',
+    });
+  }
+}
+
+/**
+ * GET /api/reports/expenses-detailed
+ * Gastos detallados
+ */
+async function getExpensesDetailed(req, res) {
+  try {
+    const { start_date, end_date, limit = 50, shift_id } = req.query;
+    let whereClause = "WHERE type = 'gasto'";
+    const params = [];
+
+    if (shift_id) {
+        whereClause += ' AND shift_id = ?';
+        params.push(shift_id);
+    } else if (start_date && end_date) {
+      whereClause += ' AND created_at BETWEEN ? AND ?';
+      params.push(new Date(start_date), new Date(end_date));
+    }
+
+    params.push(parseInt(limit));
+
+    const results = await query(
+      `SELECT * FROM movements
+       ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT ?`,
+      params
+    );
+
+    res.json({
+      success: true,
+      data: results.map((m) => ({
+        id: m.id,
+        amount: parseFloat(m.amount),
+        description: m.description,
+        createdAt: m.created_at,
+        shiftId: m.shift_id,
+      })),
+    });
+  } catch (error) {
+    console.error('Error obteniendo gastos detallados:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error obteniendo gastos detallados',
     });
   }
 }
@@ -410,4 +667,7 @@ module.exports = {
   getShiftsHistory,
   getShiftDetail,
   getPendingDebts,
+  getDetailedSales,
+  getLowRotationProducts,
+  getExpensesDetailed,
 };

@@ -44,4 +44,22 @@ router.get('/shift/:id', verifyToken, requireAdmin, reportsController.getShiftDe
  */
 router.get('/debts', verifyToken, requireAdmin, reportsController.getPendingDebts);
 
+/**
+ * GET /api/reports/detailed-sales
+ * Ventas detalladas (Excel)
+ */
+router.get('/detailed-sales', verifyToken, requireAdmin, reportsController.getDetailedSales);
+
+/**
+ * GET /api/reports/low-rotation
+ * Productos con baja rotación
+ */
+router.get('/low-rotation', verifyToken, requireAdmin, reportsController.getLowRotationProducts);
+
+/**
+ * GET /api/reports/expenses-detailed
+ * Gastos detallados
+ */
+router.get('/expenses-detailed', verifyToken, requireAdmin, reportsController.getExpensesDetailed);
+
 module.exports = router;

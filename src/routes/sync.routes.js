@@ -23,6 +23,18 @@ router.post('/sales', verifyToken, syncController.syncSales);
 router.post('/movements', verifyToken, syncController.syncMovements);
 
 /**
+ * POST /api/sync/customers
+ * Sincronización de clientes
+ */
+router.post('/customers', verifyToken, syncController.syncCustomers);
+
+/**
+ * POST /api/sync/credit-transactions
+ * Sincronización de transacciones de crédito
+ */
+router.post('/credit-transactions', verifyToken, syncController.syncCreditTransactions);
+
+/**
  * GET /api/sync/status
  * Estado de sincronización
  */

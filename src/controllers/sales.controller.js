@@ -87,7 +87,7 @@ async function updateItemStatus(req, res) {
     const { saleId, itemId } = req.params;
     const { status } = req.body;
 
-    if (!['pending', 'preparing', 'ready', 'delivered'].includes(status)) {
+    if (!['pending', 'preparing', 'ready', 'delivered', 'cancelled'].includes(status)) {
       return res.status(400).json({ success: false, error: 'Estado inválido' });
     }
 
@@ -148,8 +148,8 @@ async function cancelSale(req, res) {
     }
     const tableId = saleCheck[0].table_id;
 
-    // 2. Eliminar todos los sale_items (según requerimiento)
-    await query('DELETE FROM sale_items WHERE sale_id = ?', [saleId]);
+    // 2. Marcar todos los sale_items como cancelados
+    await query("UPDATE sale_items SET preparation_status = 'cancelled', is_synced = 1 WHERE sale_id = ?", [saleId]);
 
     // 3. Actualizar estado de la venta a 'cancelled'
     await query(
@@ -158,12 +158,15 @@ async function cancelSale(req, res) {
     );
 
     // 4. Emitir evento de actualización (venta cancelada)
-    // Enviamos items vacíos
+    // Enviamos items vacíos o con estado cancelado? 
+    // Para limpiar la pantalla del POS, items vacíos funciona bien, pero para reportes/cocina tal vez quieran verlos tachados.
+    // Por ahora mantengamos items vacíos para el frontend de POS (limpia el carrito), 
+    // pero la BD ya tiene los datos correctos.
     if (tableId) {
       socketEvents.emitOrderUpdate({
         tableId,
         saleId,
-        items: [],
+        items: [], // Enviamos lista vacía para limpiar la vista del POS/Mesas
         status: 'cancelled',
         timestamp: new Date().toISOString()
       });
