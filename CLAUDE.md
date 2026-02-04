@@ -197,177 +197,26 @@ JWT_SECRET=cambiar-en-produccion
 JWT_EXPIRES_IN=24h
 
 CORS_ORIGINS=http://localhost:5173
-RATE_LIMIT_WINDOW_MS=900000
-RATE_LIMIT_MAX_REQUESTS=100
 ```
 
-## Seguridad
+## Sistema de Créditos y Deudas
 
-### Implementado
-- JWT para autenticación stateless
-- Helmet para headers de seguridad
-- CORS configurado por origen
-- Rate limiting por IP
-- Validación de inputs
-- Soft delete (usuarios nunca se eliminan físicamente)
-- No se puede eliminar usuario con turno abierto
-- **Hashing de PIN con bcrypt** (bcryptjs, 10 rounds)
-  - Los PINs nuevos se guardan hasheados automáticamente
-  - PINs en texto plano se migran automáticamente al hacer login
-  - Campo `pin_code` es VARCHAR(60) para soportar hashes
+### Sincronización de Deudas (Fuente de Verdad)
+- **Regla de Oro**: La deuda (`current_debt`) se calcula en el servidor.
+- **Sync Inverso**:
+  - `syncCustomers` NO sobrescribe `current_debt` con datos del dispositivo.
+  - Solo actualiza nombre, teléfono, dirección, etc.
+- **Atomicidad**:
+  - Al recibir una transacción de crédito (`syncCreditTransactions`), se recalcula la deuda del cliente atómicamente (`UPDATE customers SET current_debt = current_debt + ?`).
 
-### Pendiente / Recomendado
-- HTTPS obligatorio en producción
-- Logs de auditoría más detallados
-- Backup automático de base de datos
+### Scripts de Mantenimiento
+- `scripts/recalculate_debts.js`:
+  - Recalcula la deuda de TODOS los clientes basándose en la suma histórica de `credit_transactions`.
+  - Útil para corregir inconsistencias por fallos de sync previos.
 
-## Comandos
-
-```bash
-# Desarrollo (con nodemon)
-npm run dev
-
-# Producción
-npm start
-
-# Instalar dependencias
-npm install
-```
-
-## Despliegue en cPanel
-
-1. Crear base de datos MySQL en cPanel
-2. Ejecutar `sql/schema.sql` en phpMyAdmin
-3. Subir archivos (sin node_modules)
-4. Crear `.env` con credenciales de producción
-5. Configurar Node.js App en cPanel
-6. `npm install --production`
-7. Iniciar aplicación
-
-## Relación con Frontend
-
-### Frontend (el-super-cafe)
-- React + Vite + TypeScript
-- Dexie.js (IndexedDB) para datos locales
-- Funciona 100% offline
-- Sincroniza cuando detecta conexión
-
-### Backend (el-super-cafe-backend)
-- Recibe datos sincronizados
-- Proporciona reportes consolidados
-- Gestión centralizada de usuarios
-- Backup de datos en MySQL
-
-## Notas para el Asistente
-
-- Los UUIDs para **ventas, turnos, movimientos** se generan en el frontend con `crypto.randomUUID()`
-- Los **usuarios** tienen IDs fijos que deben coincidir con el frontend:
-  - `u1-soporte-001` - Soporte Técnico (PIN: 2908, admin)
-  - `u2-admin-002` - Administrador Café (PIN: 1234, admin)
-  - `u3-cajero-003` - Cajero (PIN: 0000, employee)
-- El backend solo recibe y almacena, nunca genera IDs nuevos para datos sincronizados
-- `is_synced` en MySQL siempre es 1 (ya fue sincronizado)
-- La tabla `sync_log` registra cada operación de sincronización
-- Los turnos (`shifts`) son del dispositivo, no del usuario - cualquier empleado puede operar en un turno abierto
-- El campo `observation` en `sales` es para explicar por qué un cliente no pagó (deuda/fiado)
-- `processInventoryDeduction(saleId)` está exportada en sync.controller.js para uso externo si es necesario
-- El descuento de inventario **solo ocurre para ventas nuevas completadas** - re-sincronizar la misma venta no duplica el descuento
-- **Evento `movement:create`** incluye `shiftId` para que los dispositivos puedan asociar gastos al turno correcto
-- **Endpoint `/api/sync/sales/pending`** retorna ventas, items y mesas ocupadas para sincronización PULL antes de PUSH
-
-## Transit State: Handover de Mesas entre Turnos
-
-### Concepto
-El "Transit State" permite traspasar mesas pendientes de un usuario a otro sin crear el turno del receptor inmediatamente. Las ventas quedan en un estado de tránsito hasta que el receptor abra su turno.
-
-### Flujo de Usuario A (cerrando turno)
-1. En `CashCloseModal`, si hay ventas pendientes, aparece botón "Traspasar Mesas"
-2. Usuario A selecciona al receptor (Usuario B)
-3. Sistema llama a `POST /api/sync/shifts/transfer-tables` que:
-   - Establece `shift_id = NULL` en las ventas
-   - Establece `pending_receiver_user_id = Usuario B's ID`
-4. Usuario A puede completar su arqueo de caja y cerrar turno normalmente
-
-### Flujo de Usuario B (abriendo turno)
-1. Usuario B abre su turno manualmente como siempre
-2. Al crear el turno, `syncShift()` llama a `linkOrphanSalesToShift()`:
-   - Busca ventas donde `shift_id IS NULL AND pending_receiver_user_id = Usuario B's ID`
-   - Las vincula al nuevo turno: `shift_id = nuevo_turno_id, pending_receiver_user_id = NULL`
-3. Frontend ejecuta `SyncService.syncAll()` para descargar las mesas traspasadas
-
-### Endpoints Relacionados
-| Método | Endpoint | Descripción |
-|--------|----------|-------------|
-| POST | `/api/sync/shifts/transfer-tables` | Traspasa ventas pendientes a un usuario receptor |
-
-### Campo `pending_receiver_user_id` en `sales`
-- `VARCHAR(36)` - ID del usuario que recibirá las ventas al abrir su turno
-- Solo tiene valor cuando las ventas están en tránsito (`shift_id IS NULL`)
-- Se limpia automáticamente al vincular las ventas al nuevo turno
-
-### Eventos de Socket
-- `sales:transfer`: Notifica que ventas fueron traspasadas a un usuario
-- `sales:linked`: Notifica que ventas huérfanas fueron vinculadas a un turno
-
-### Respuesta de Sincronización con Mesas Heredadas
-Cuando User B abre su turno y el backend vincula ventas huérfanas, la respuesta de `/api/sync` incluye:
-```json
-{
-  "success": true,
-  "data": {
-    "shifts": { "synced": 1, "errors": [] },
-    "linkedSalesInfo": {
-      "shiftId": "uuid-del-nuevo-turno",
-      "linkedSalesCount": 3,
-      "linkedTables": [
-        { "id": "table-uuid-1", "name": "Mesa 1" },
-        { "id": "table-uuid-2", "name": "Mesa 2" }
-      ]
-    }
-  }
-}
-```
-El frontend usa esta información para mostrar el modal de bienvenida a User B.
-
-## Sistema de Inventario Inteligente
-
-### Migración SQL (`004_inventory_intelligence.sql`)
-Agrega:
-- `products.cost_unit`: Costo unitario para cálculo de utilidad
-- `products.stock_min`: Stock mínimo para alertas
-- `sales.gross_profit`: Utilidad bruta calculada
-- Tabla `stock_adjustments`: Historial de ajustes de inventario
-
-### Nuevas Funciones en `utils/math.js`
-| Función | Descripción |
-|---------|-------------|
-| `calculateSaleCost(items, queryFn)` | Calcula costo total de insumos para una venta |
-| `calculateGrossProfit(total, cost)` | Retorna utilidad bruta (Total - Costo) |
-
-### Cálculo de Utilidad Bruta
-- Se ejecuta automáticamente al sincronizar ventas `completed`
-- Considera productos directos (`manage_stock = 1`) y recetas
-- Aplica multiplicadores por modificadores (extras/exclusiones)
-- Resultado guardado en `sales.gross_profit`
-
-### Consumos Decimales
-- `StockService` soporta cantidades decimales (ej: 0.2 unidades de tomate)
-- `quantity_required` en recetas acepta decimales
-- Extras descuentan su respectivo insumo del stock
-
-### Tabla `stock_adjustments`
-```sql
-CREATE TABLE stock_adjustments (
-    id VARCHAR(36) PRIMARY KEY,
-    product_id VARCHAR(36) NOT NULL,
-    type ENUM('entrada', 'salida') NOT NULL,
-    quantity DECIMAL(12, 2) NOT NULL,
-    reason ENUM('compra', 'merma', 'dano', 'correccion', 'otro'),
-    description VARCHAR(255),
-    previous_stock DECIMAL(12, 2),
-    new_stock DECIMAL(12, 2),
-    created_by_id VARCHAR(36),
-    created_by_name VARCHAR(100),
-    ...
-);
-```
+### Reportes y Abonos
+- **Endpoint `getShiftDetail`**:
+  - Ahora incluye `totalAbonos` (suma de pagos en el turno).
+  - Retorna array `abonos` con detalle (cliente, monto, fecha).
+- **Filtros**:
+  - Endpoints de reportes soportan filtrado por `shift_id` para alineación exacta con turnos de caja.

@@ -1725,7 +1725,6 @@ async function syncCustomers(req, res) {
             address = VALUES(address),
             email = VALUES(email),
             credit_limit = VALUES(credit_limit),
-            current_debt = VALUES(current_debt),
             is_active = VALUES(is_active),
             is_synced = 1,
             updated_at = CURRENT_TIMESTAMP`,
@@ -1763,7 +1762,11 @@ async function syncCreditTransactions(req, res) {
 
   try {
     await transaction(async (conn) => {
+      const affectedCustomerIds = new Set();
+
       for (const t of transactions) {
+        if (t.customer_id) affectedCustomerIds.add(t.customer_id);
+
         await conn.execute(
           `INSERT INTO credit_transactions (
             id, customer_id, type, amount, remaining, sale_id,
@@ -1783,6 +1786,20 @@ async function syncCreditTransactions(req, res) {
             t.description || null,
             new Date(t.created_at || Date.now())
           ]
+        );
+      }
+
+      // Recalcular deuda para clientes afectados
+      for (const customerId of affectedCustomerIds) {
+        await conn.execute(
+          `UPDATE customers 
+           SET current_debt = (
+             SELECT COALESCE(SUM(remaining), 0) 
+             FROM credit_transactions 
+             WHERE customer_id = ? AND remaining > 0
+           )
+           WHERE id = ?`,
+          [customerId, customerId]
         );
       }
     });

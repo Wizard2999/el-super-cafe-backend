@@ -344,6 +344,16 @@ async function getShiftDetail(req, res) {
       [id]
     );
 
+    // Obtener abonos (pagos de créditos) del turno
+    const abonos = await query(
+      `SELECT ct.*, c.name as customer_name 
+       FROM credit_transactions ct 
+       LEFT JOIN customers c ON ct.customer_id = c.id
+       WHERE ct.shift_id = ? AND ct.type = 'payment' 
+       ORDER BY ct.created_at DESC`,
+      [id]
+    );
+
     // Calcular totales
     const salesCash = sales
       .filter((s) => s.status === 'completed' && s.payment_method === 'efectivo')
@@ -356,6 +366,8 @@ async function getShiftDetail(req, res) {
     const totalExpenses = movements
       .filter((m) => m.type === 'gasto')
       .reduce((sum, m) => sum + parseFloat(m.amount), 0);
+      
+    const totalAbonos = abonos.reduce((sum, a) => sum + parseFloat(a.amount), 0);
 
     res.json({
       success: true,
@@ -386,7 +398,8 @@ async function getShiftDetail(req, res) {
           salesTransfer,
           totalSales: salesCash + salesTransfer,
           totalExpenses,
-          expectedCash: parseFloat(shift.initial_cash) + salesCash - totalExpenses,
+          totalAbonos,
+          expectedCash: parseFloat(shift.initial_cash) + salesCash + totalAbonos - totalExpenses,
         },
         sales: sales.map((s) => ({
           id: s.id,
@@ -402,6 +415,12 @@ async function getShiftDetail(req, res) {
           amount: parseFloat(m.amount),
           description: m.description,
           createdAt: m.created_at,
+        })),
+        abonos: abonos.map((a) => ({
+          id: a.id,
+          amount: parseFloat(a.amount),
+          customerName: a.customer_name || 'Cliente Eliminado',
+          createdAt: a.created_at,
         })),
       },
     });

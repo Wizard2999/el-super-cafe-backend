@@ -145,6 +145,17 @@ const registerPayment = async (req, res) => {
       'INSERT INTO movements (id, type, amount, description, shift_id, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
       [movementId, 'abono', amount, description || `Abono cliente ${customer.name}`, shift_id]
     );
+
+    if (req.io) {
+      req.io.emit('movement:create', {
+        movementId,
+        type: 'abono',
+        amount: parseFloat(amount),
+        description: description || `Abono cliente ${customer.name}`,
+        timestamp: new Date().toISOString(),
+        shiftId: shift_id
+      });
+    }
     
     // 4. Distribute payment across charges
     for (const charge of charges) {
