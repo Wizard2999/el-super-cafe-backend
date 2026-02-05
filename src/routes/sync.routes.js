@@ -88,4 +88,10 @@ router.post('/shifts/transfer-tables', verifyToken, syncController.transferTable
  */
 router.get('/sales/pending', verifyToken, syncController.getPendingSales);
 
+/**
+ * GET /api/sync/shift/:shiftId/full
+ * Obtener datos completos de un turno (Ventas, Items, Gastos, Abonos)
+ */
+router.get('/shift/:shiftId/full', verifyToken, syncController.getFullShiftData);
+
 module.exports = router;

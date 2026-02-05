@@ -1810,6 +1810,52 @@ async function syncCreditTransactions(req, res) {
   }
 }
 
+/**
+ * GET /api/sync/shift/:shiftId/full
+ * Obtiene TODOS los datos de un turno para restaurar estado en dispositivo
+ * Incluye: Sales, SaleItems, Movements, CreditTransactions
+ */
+async function getFullShiftData(req, res) {
+  try {
+    const { shiftId } = req.params;
+
+    if (!shiftId) {
+      return res.status(400).json({ success: false, error: 'Shift ID requerido' });
+    }
+
+    const shift = await query('SELECT * FROM shifts WHERE id = ?', [shiftId]);
+    if (shift.length === 0) {
+      return res.status(404).json({ success: false, error: 'Turno no encontrado' });
+    }
+
+    const sales = await query('SELECT * FROM sales WHERE shift_id = ?', [shiftId]);
+    
+    let saleItems = [];
+    if (sales.length > 0) {
+      const saleIds = sales.map(s => s.id);
+      const placeholders = saleIds.map(() => '?').join(',');
+      saleItems = await query(`SELECT * FROM sale_items WHERE sale_id IN (${placeholders})`, saleIds);
+    }
+
+    const movements = await query('SELECT * FROM movements WHERE shift_id = ?', [shiftId]);
+    const creditTransactions = await query('SELECT * FROM credit_transactions WHERE shift_id = ?', [shiftId]);
+
+    res.json({
+      success: true,
+      data: {
+        shift: shift[0],
+        sales,
+        sale_items: saleItems,
+        movements,
+        credit_transactions: creditTransactions
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching full shift data:', error);
+    res.status(500).json({ success: false, error: 'Error interno' });
+  }
+}
+
 module.exports = {
   syncFromDevice,
   syncSales,
@@ -1826,4 +1872,5 @@ module.exports = {
   atomicShiftHandover,
   transferTablesToUser,
   linkOrphanSalesToShift,
+  getFullShiftData,
 };
