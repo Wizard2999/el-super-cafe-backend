@@ -715,11 +715,12 @@ async function syncSales(req, res) {
   const deviceId = req.headers['x-device-id'] || 'unknown';
 
   try {
-    const { sales = [], sale_items = [] } = req.body;
+    const { sales = [], sale_items = [], sale_payments = [] } = req.body;
 
     const results = {
       sales: { synced: 0, errors: [] },
       sale_items: { synced: 0, errors: [] },
+      sale_payments: { synced: 0, errors: [] },
       inventory: { processed: 0, errors: [] },
     };
 
@@ -730,6 +731,15 @@ async function syncSales(req, res) {
         itemsBySaleId.set(item.sale_id, []);
       }
       itemsBySaleId.get(item.sale_id).push(item);
+    }
+
+    // Agrupar pagos por sale_id
+    const paymentsBySaleId = new Map();
+    for (const payment of sale_payments) {
+      if (!paymentsBySaleId.has(payment.sale_id)) {
+        paymentsBySaleId.set(payment.sale_id, []);
+      }
+      paymentsBySaleId.get(payment.sale_id).push(payment);
     }
 
     // Procesar cada venta
@@ -827,7 +837,25 @@ async function syncSales(req, res) {
               );
             }
 
-            // 3. Recalcular total real desde items
+            // 2b. Sincronizar pagos (REPLACE STRATEGY)
+            const salePayments = paymentsBySaleId.get(sale.id) || [];
+            if (salePayments.length > 0) {
+              await conn.execute('DELETE FROM sale_payments WHERE sale_id = ?', [sale.id]);
+              for (const payment of salePayments) {
+                await conn.execute(
+                  `INSERT INTO sale_payments (
+                    id, sale_id, payment_method, amount, is_synced, created_at
+                  ) VALUES (?, ?, ?, ?, 1, ?)
+                  ON DUPLICATE KEY UPDATE
+                    amount = VALUES(amount),
+                    is_synced = 1,
+                    updated_at = CURRENT_TIMESTAMP`,
+                  [payment.id, payment.sale_id, payment.payment_method, payment.amount, new Date(payment.created_at)]
+                );
+              }
+            }
+
+          // 3. Recalcular total real desde items
             const [totalRes] = await conn.execute(
               'SELECT SUM(quantity * unit_price) as total FROM sale_items WHERE sale_id = ?',
               [sale.id]
@@ -890,6 +918,26 @@ async function syncSales(req, res) {
                 id: item.id,
                 error: error.message,
               });
+            }
+          }
+
+          // 2b. Sincronizar pagos
+          const salePayments = paymentsBySaleId.get(sale.id) || [];
+          if (salePayments.length > 0) {
+            try {
+              await query('DELETE FROM sale_payments WHERE sale_id = ?', [sale.id]);
+              for (const payment of salePayments) {
+                await syncSalePayment(payment);
+                results.sale_payments.synced++;
+              }
+            } catch (error) {
+              console.error(`Error sincronizando pagos para venta ${sale.id}:`, error);
+               for (const payment of salePayments) {
+                results.sale_payments.errors.push({
+                  id: payment.id,
+                  error: error.message,
+                });
+              }
             }
           }
 
