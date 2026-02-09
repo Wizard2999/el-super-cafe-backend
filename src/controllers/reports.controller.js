@@ -54,6 +54,34 @@ async function getSalesSummary(req, res) {
       params
     );
 
+    // Obtener desglose de pagos mixtos (payment_method = 'multiple')
+    // Necesitamos sumar los montos de sale_payments para estas ventas
+    let mixedWhere = "WHERE s.status = 'completed' AND s.payment_method = 'multiple'";
+    const mixedParams = [];
+
+    if (shift_id) {
+      mixedWhere += " AND s.shift_id = ?";
+      mixedParams.push(shift_id);
+    } else if (start_date && end_date) {
+      mixedWhere += " AND s.created_at BETWEEN ? AND ?";
+      mixedParams.push(startDate, endDate);
+    } else {
+      mixedWhere += " AND s.created_at BETWEEN ? AND ?";
+      mixedParams.push(startDate, endDate);
+    }
+
+    const mixedSummary = await query(
+      `SELECT 
+        COALESCE(SUM(CASE WHEN sp.payment_method = 'efectivo' THEN sp.amount ELSE 0 END), 0) as mixed_cash,
+        COALESCE(SUM(CASE WHEN sp.payment_method = 'transferencia' THEN sp.amount ELSE 0 END), 0) as mixed_transfer
+       FROM sales s
+       JOIN sale_payments sp ON s.id = sp.sale_id
+       ${mixedWhere}`,
+       mixedParams
+    );
+
+    const mixed = mixedSummary[0] || { mixed_cash: 0, mixed_transfer: 0 };
+
     // Resumen de gastos
     // Nota: expensesSummary necesita su propio whereClause porque 'movements' tiene 'type'='gasto'
     // y puede tener shift_id o fechas.
@@ -112,6 +140,10 @@ async function getSalesSummary(req, res) {
     const debts = debtsSummary[0];
     const abonos = abonosSummary[0];
 
+    // Combinar ventas directas + mixtas
+    const totalCashSales = parseFloat(sales.cash_sales) + parseFloat(mixed.mixed_cash || 0);
+    const totalTransferSales = parseFloat(sales.transfer_sales) + parseFloat(mixed.mixed_transfer || 0);
+
     res.json({
       success: true,
       data: {
@@ -121,8 +153,8 @@ async function getSalesSummary(req, res) {
         },
         sales: {
           totalTransactions: parseInt(sales.total_transactions),
-          cashSales: parseFloat(sales.cash_sales),
-          transferSales: parseFloat(sales.transfer_sales),
+          cashSales: totalCashSales,
+          transferSales: totalTransferSales,
           totalSales: parseFloat(sales.total_sales),
         },
         expenses: {
@@ -138,7 +170,7 @@ async function getSalesSummary(req, res) {
           total: parseFloat(abonos.total_amount),
         },
         netProfit: parseFloat(sales.total_sales) - parseFloat(expenses.total_expenses),
-        cashFlow: parseFloat(sales.cash_sales) + parseFloat(abonos.total_amount) - parseFloat(expenses.total_expenses),
+        cashFlow: totalCashSales + parseFloat(abonos.total_amount) - parseFloat(expenses.total_expenses),
       },
     });
   } catch (error) {
@@ -160,15 +192,35 @@ async function getSalesByDay(req, res) {
 
     const results = await query(
       `SELECT
-        DATE(created_at) AS sale_date,
+        DATE(s.created_at) AS sale_date,
         COUNT(*) AS transactions,
-        SUM(CASE WHEN payment_method = 'efectivo' THEN total ELSE 0 END) AS cash,
-        SUM(CASE WHEN payment_method = 'transferencia' THEN total ELSE 0 END) AS transfer,
-        SUM(total) AS total
-       FROM sales
-       WHERE status = 'completed'
-         AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-       GROUP BY DATE(created_at)
+        SUM(
+            CASE 
+                WHEN s.payment_method = 'efectivo' THEN s.total 
+                WHEN s.payment_method = 'multiple' THEN (
+                    SELECT COALESCE(SUM(sp.amount), 0) 
+                    FROM sale_payments sp 
+                    WHERE sp.sale_id = s.id AND sp.payment_method = 'efectivo'
+                )
+                ELSE 0 
+            END
+        ) AS cash,
+        SUM(
+            CASE 
+                WHEN s.payment_method = 'transferencia' THEN s.total 
+                WHEN s.payment_method = 'multiple' THEN (
+                    SELECT COALESCE(SUM(sp.amount), 0) 
+                    FROM sale_payments sp 
+                    WHERE sp.sale_id = s.id AND sp.payment_method = 'transferencia'
+                )
+                ELSE 0 
+            END
+        ) AS transfer,
+        SUM(s.total) AS total
+       FROM sales s
+       WHERE s.status = 'completed'
+         AND s.created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY DATE(s.created_at)
        ORDER BY sale_date DESC`,
       [parseInt(days)]
     );
@@ -267,7 +319,21 @@ async function getShiftsHistory(req, res) {
       `SELECT
         s.*,
         (SELECT COALESCE(SUM(sa.total), 0) FROM sales sa WHERE sa.shift_id = s.id AND sa.status = 'completed') AS total_sales,
-        (SELECT COALESCE(SUM(sa.total), 0) FROM sales sa WHERE sa.shift_id = s.id AND sa.status = 'completed' AND sa.payment_method = 'efectivo') AS cash_sales,
+        (
+          SELECT COALESCE(SUM(
+            CASE 
+                WHEN sa.payment_method = 'efectivo' THEN sa.total
+                WHEN sa.payment_method = 'multiple' THEN (
+                    SELECT COALESCE(SUM(sp.amount), 0)
+                    FROM sale_payments sp
+                    WHERE sp.sale_id = sa.id AND sp.payment_method = 'efectivo'
+                )
+                ELSE 0
+            END
+          ), 0)
+          FROM sales sa 
+          WHERE sa.shift_id = s.id AND sa.status = 'completed'
+        ) AS cash_sales,
         (SELECT COALESCE(SUM(ct.amount), 0) FROM credit_transactions ct WHERE ct.shift_id = s.id AND ct.type = 'payment') AS total_abonos,
         (SELECT COALESCE(SUM(m.amount), 0) FROM movements m WHERE m.shift_id = s.id AND m.type = 'gasto') AS total_expenses
        FROM shifts s
@@ -338,6 +404,15 @@ async function getShiftDetail(req, res) {
       [id]
     );
 
+    // Obtener pagos mixtos del turno
+    const salePayments = await query(
+      `SELECT sp.* 
+       FROM sale_payments sp
+       JOIN sales s ON sp.sale_id = s.id
+       WHERE s.shift_id = ?`,
+      [id]
+    );
+
     // Obtener movimientos del turno
     const movements = await query(
       `SELECT * FROM movements WHERE shift_id = ? ORDER BY created_at DESC`,
@@ -355,13 +430,28 @@ async function getShiftDetail(req, res) {
     );
 
     // Calcular totales
-    const salesCash = sales
-      .filter((s) => s.status === 'completed' && s.payment_method === 'efectivo')
-      .reduce((sum, s) => sum + parseFloat(s.total), 0);
+    let salesCash = 0;
+    let salesTransfer = 0;
 
-    const salesTransfer = sales
-      .filter((s) => s.status === 'completed' && s.payment_method === 'transferencia')
-      .reduce((sum, s) => sum + parseFloat(s.total), 0);
+    sales.forEach(s => {
+      if (s.status === 'completed') {
+        if (s.payment_method === 'efectivo') {
+          salesCash += parseFloat(s.total);
+        } else if (s.payment_method === 'transferencia') {
+          salesTransfer += parseFloat(s.total);
+        } else if (s.payment_method === 'multiple') {
+          // Sumar pagos mixtos
+          const payments = salePayments.filter(sp => sp.sale_id === s.id);
+          payments.forEach(p => {
+            if (p.payment_method === 'efectivo') {
+              salesCash += parseFloat(p.amount);
+            } else if (p.payment_method === 'transferencia') {
+              salesTransfer += parseFloat(p.amount);
+            }
+          });
+        }
+      }
+    });
 
     const totalExpenses = movements
       .filter((m) => m.type === 'gasto')
@@ -408,6 +498,12 @@ async function getShiftDetail(req, res) {
           status: s.status,
           observation: s.observation,
           createdAt: s.created_at,
+          payments: salePayments
+            .filter(sp => sp.sale_id === s.id)
+            .map(p => ({
+              method: p.payment_method,
+              amount: parseFloat(p.amount)
+            }))
         })),
         movements: movements.map((m) => ({
           id: m.id,
@@ -553,7 +649,12 @@ async function getDetailedSales(req, res) {
         si.product_name,
         si.quantity,
         si.unit_price,
-        si.modifiers
+        si.modifiers,
+        (
+            SELECT GROUP_CONCAT(CONCAT(payment_method, ': ', amount) SEPARATOR ' | ')
+            FROM sale_payments sp
+            WHERE sp.sale_id = s.id
+        ) as mixed_payment_details
        FROM sale_items si
        JOIN sales s ON si.sale_id = s.id
        ${whereClause}
@@ -566,7 +667,7 @@ async function getDetailedSales(req, res) {
       data: results.map((r) => ({
         saleId: r.sale_id,
         date: r.created_at,
-        paymentMethod: r.payment_method,
+        paymentMethod: r.payment_method === 'multiple' ? (r.mixed_payment_details || 'Mixto') : r.payment_method,
         observation: r.sale_observation,
         productName: r.product_name,
         quantity: parseFloat(r.quantity),

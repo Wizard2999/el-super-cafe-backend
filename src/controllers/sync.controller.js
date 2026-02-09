@@ -48,11 +48,12 @@ async function syncFromDevice(req, res) {
   const deviceId = req.headers['x-device-id'] || 'unknown';
 
   try {
-    const { sales = [], sale_items = [], movements = [], shifts = [] } = req.body;
+    const { sales = [], sale_items = [], sale_payments = [], movements = [], shifts = [] } = req.body;
 
     const results = {
       sales: { synced: 0, errors: [] },
       sale_items: { synced: 0, errors: [] },
+      sale_payments: { synced: 0, errors: [] },
       movements: { synced: 0, errors: [] },
       shifts: { synced: 0, errors: [] },
       inventory: { processed: 0, errors: [] },
@@ -174,6 +175,36 @@ async function syncFromDevice(req, res) {
         for (const item of items) {
           results.sale_items.errors.push({
             id: item.id,
+            error: error.message,
+          });
+        }
+      }
+    }
+
+    // Sincronizar pagos de venta (desglose)
+    const paymentsBySaleId = new Map();
+    for (const payment of sale_payments) {
+      if (!paymentsBySaleId.has(payment.sale_id)) {
+        paymentsBySaleId.set(payment.sale_id, []);
+      }
+      paymentsBySaleId.get(payment.sale_id).push(payment);
+    }
+
+    for (const [saleId, payments] of paymentsBySaleId) {
+      try {
+        // 1. Limpiar pagos anteriores para esta venta
+        await query('DELETE FROM sale_payments WHERE sale_id = ?', [saleId]);
+
+        // 2. Insertar nuevos pagos
+        for (const payment of payments) {
+          await syncSalePayment(payment);
+          results.sale_payments.synced++;
+        }
+      } catch (error) {
+        console.error(`Error sincronizando pagos para venta ${saleId}:`, error);
+        for (const payment of payments) {
+          results.sale_payments.errors.push({
+            id: payment.id,
             error: error.message,
           });
         }
@@ -461,6 +492,29 @@ async function syncSaleItem(item) {
     modifiersValue,
     preparationStatus,
     item.observations || null,
+  ]);
+}
+
+/**
+ * Sincronizar un pago de venta
+ */
+async function syncSalePayment(payment) {
+  const sql = `
+    INSERT INTO sale_payments (
+      id, sale_id, payment_method, amount, is_synced, created_at
+    ) VALUES (?, ?, ?, ?, 1, ?)
+    ON DUPLICATE KEY UPDATE
+      amount = VALUES(amount),
+      is_synced = 1,
+      updated_at = CURRENT_TIMESTAMP
+  `;
+
+  await query(sql, [
+    payment.id,
+    payment.sale_id,
+    payment.payment_method,
+    payment.amount,
+    new Date(payment.created_at),
   ]);
 }
 
@@ -1189,12 +1243,22 @@ async function getPendingSales(req, res) {
 
     // Obtener items de todas las ventas pendientes (incluir modifiers y preparation_status)
     let saleItems = [];
+    let salePayments = [];
+
     if (sales.length > 0) {
       const saleIds = sales.map(s => s.id);
       const placeholders = saleIds.map(() => '?').join(',');
       saleItems = await query(
         `SELECT id, sale_id, product_id, product_name, quantity, unit_price, modifiers, preparation_status
          FROM sale_items
+         WHERE sale_id IN (${placeholders})`,
+        saleIds
+      );
+
+      // Obtener pagos de las ventas pendientes
+      salePayments = await query(
+        `SELECT id, sale_id, payment_method, amount, created_at
+         FROM sale_payments
          WHERE sale_id IN (${placeholders})`,
         saleIds
       );
@@ -1252,11 +1316,16 @@ async function getPendingSales(req, res) {
           ...item,
           unit_price: parseFloat(item.unit_price),
         })),
+        sale_payments: salePayments.map(p => ({
+          ...p,
+          amount: parseFloat(p.amount),
+        })),
         tables: occupiedTables,
       },
       count: {
         sales: sales.length,
         items: saleItems.length,
+        payments: salePayments.length,
         tables: occupiedTables.length,
       },
     });
@@ -1831,10 +1900,12 @@ async function getFullShiftData(req, res) {
     const sales = await query('SELECT * FROM sales WHERE shift_id = ?', [shiftId]);
     
     let saleItems = [];
+    let salePayments = [];
     if (sales.length > 0) {
       const saleIds = sales.map(s => s.id);
       const placeholders = saleIds.map(() => '?').join(',');
       saleItems = await query(`SELECT * FROM sale_items WHERE sale_id IN (${placeholders})`, saleIds);
+      salePayments = await query(`SELECT * FROM sale_payments WHERE sale_id IN (${placeholders})`, saleIds);
     }
 
     const movements = await query('SELECT * FROM movements WHERE shift_id = ?', [shiftId]);
@@ -1846,6 +1917,7 @@ async function getFullShiftData(req, res) {
         shift: shift[0],
         sales,
         sale_items: saleItems,
+        sale_payments: salePayments,
         movements,
         credit_transactions: creditTransactions
       }
