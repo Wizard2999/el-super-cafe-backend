@@ -43,6 +43,7 @@ async function getSalesSummary(req, res) {
     }
 
     // Resumen de ventas
+    // 1. Ventas simples (sin desglose en sale_payments)
     const salesSummary = await query(
       `SELECT
         COUNT(*) AS total_transactions,
@@ -50,37 +51,40 @@ async function getSalesSummary(req, res) {
         COALESCE(SUM(CASE WHEN payment_method = 'transferencia' THEN total ELSE 0 END), 0) AS transfer_sales,
         COALESCE(SUM(total), 0) AS total_sales
        FROM sales
-       ${whereClause}`,
+       ${whereClause} AND id NOT IN (SELECT DISTINCT sale_id FROM sale_payments)`,
       params
     );
 
-    // Obtener desglose de pagos mixtos (payment_method = 'multiple')
-    // Necesitamos sumar los montos de sale_payments para estas ventas
-    let mixedWhere = "WHERE s.status = 'completed' AND s.payment_method = 'multiple'";
-    const mixedParams = [];
-
-    if (shift_id) {
-      mixedWhere += " AND s.shift_id = ?";
-      mixedParams.push(shift_id);
-    } else if (start_date && end_date) {
-      mixedWhere += " AND s.created_at BETWEEN ? AND ?";
-      mixedParams.push(startDate, endDate);
-    } else {
-      mixedWhere += " AND s.created_at BETWEEN ? AND ?";
-      mixedParams.push(startDate, endDate);
-    }
-
+    // 2. Desglose de pagos (para todas las ventas que tienen registros en sale_payments)
+    // Esto cubre tanto ventas mixtas como ventas simples sincronizadas con desglose
     const mixedSummary = await query(
       `SELECT 
         COALESCE(SUM(CASE WHEN sp.payment_method = 'efectivo' THEN sp.amount ELSE 0 END), 0) as mixed_cash,
-        COALESCE(SUM(CASE WHEN sp.payment_method = 'transferencia' THEN sp.amount ELSE 0 END), 0) as mixed_transfer
+        COALESCE(SUM(CASE WHEN sp.payment_method = 'transferencia' THEN sp.amount ELSE 0 END), 0) as mixed_transfer,
+        COUNT(DISTINCT s.id) as mixed_transactions,
+        COALESCE(SUM(sp.amount), 0) as mixed_total
        FROM sales s
        JOIN sale_payments sp ON s.id = sp.sale_id
-       ${mixedWhere}`,
-       mixedParams
+       ${whereClause.replace('WHERE', 'WHERE s.')}`,
+      params
     );
 
-    const mixed = mixedSummary[0] || { mixed_cash: 0, mixed_transfer: 0 };
+    const summary = salesSummary[0] || { cash_sales: 0, transfer_sales: 0, total_sales: 0, total_transactions: 0 };
+    const mixed = mixedSummary[0] || { mixed_cash: 0, mixed_transfer: 0, mixed_transactions: 0, mixed_total: 0 };
+
+    // Combinar resultados
+    const finalCashSales = Number(summary.cash_sales) + Number(mixed.mixed_cash);
+    const finalTransferSales = Number(summary.transfer_sales) + Number(mixed.mixed_transfer);
+    const finalTotalSales = Number(summary.total_sales) + Number(mixed.mixed_total);
+    const finalTotalTransactions = Number(summary.total_transactions) + Number(mixed.mixed_transactions);
+
+    // Reemplazar salesSummary con los valores combinados para que el resto del código funcione igual
+    salesSummary[0] = {
+      cash_sales: finalCashSales,
+      transfer_sales: finalTransferSales,
+      total_sales: finalTotalSales,
+      total_transactions: finalTotalTransactions
+    };
 
     // Resumen de gastos
     // Nota: expensesSummary necesita su propio whereClause porque 'movements' tiene 'type'='gasto'
@@ -196,23 +200,23 @@ async function getSalesByDay(req, res) {
         COUNT(*) AS transactions,
         SUM(
             CASE 
-                WHEN s.payment_method = 'efectivo' THEN s.total 
-                WHEN s.payment_method = 'multiple' THEN (
+                WHEN (SELECT COUNT(*) FROM sale_payments sp WHERE sp.sale_id = s.id) > 0 THEN (
                     SELECT COALESCE(SUM(sp.amount), 0) 
                     FROM sale_payments sp 
                     WHERE sp.sale_id = s.id AND sp.payment_method = 'efectivo'
                 )
+                WHEN s.payment_method = 'efectivo' THEN s.total 
                 ELSE 0 
             END
         ) AS cash,
         SUM(
             CASE 
-                WHEN s.payment_method = 'transferencia' THEN s.total 
-                WHEN s.payment_method = 'multiple' THEN (
+                WHEN (SELECT COUNT(*) FROM sale_payments sp WHERE sp.sale_id = s.id) > 0 THEN (
                     SELECT COALESCE(SUM(sp.amount), 0) 
                     FROM sale_payments sp 
                     WHERE sp.sale_id = s.id AND sp.payment_method = 'transferencia'
                 )
+                WHEN s.payment_method = 'transferencia' THEN s.total 
                 ELSE 0 
             END
         ) AS transfer,
@@ -322,12 +326,12 @@ async function getShiftsHistory(req, res) {
         (
           SELECT COALESCE(SUM(
             CASE 
-                WHEN sa.payment_method = 'efectivo' THEN sa.total
-                WHEN sa.payment_method = 'multiple' THEN (
+                WHEN (SELECT COUNT(*) FROM sale_payments sp WHERE sp.sale_id = sa.id) > 0 THEN (
                     SELECT COALESCE(SUM(sp.amount), 0)
                     FROM sale_payments sp
                     WHERE sp.sale_id = sa.id AND sp.payment_method = 'efectivo'
                 )
+                WHEN sa.payment_method = 'efectivo' THEN sa.total
                 ELSE 0
             END
           ), 0)
@@ -435,13 +439,9 @@ async function getShiftDetail(req, res) {
 
     sales.forEach(s => {
       if (s.status === 'completed') {
-        if (s.payment_method === 'efectivo') {
-          salesCash += parseFloat(s.total);
-        } else if (s.payment_method === 'transferencia') {
-          salesTransfer += parseFloat(s.total);
-        } else if (s.payment_method === 'multiple') {
-          // Sumar pagos mixtos
-          const payments = salePayments.filter(sp => sp.sale_id === s.id);
+        const payments = salePayments.filter(sp => sp.sale_id === s.id);
+        if (payments.length > 0) {
+          // Si tiene desglose, usarlo
           payments.forEach(p => {
             if (p.payment_method === 'efectivo') {
               salesCash += parseFloat(p.amount);
@@ -449,6 +449,13 @@ async function getShiftDetail(req, res) {
               salesTransfer += parseFloat(p.amount);
             }
           });
+        } else {
+          // Si no tiene desglose, usar el método de la venta
+          if (s.payment_method === 'efectivo') {
+            salesCash += parseFloat(s.total);
+          } else if (s.payment_method === 'transferencia') {
+            salesTransfer += parseFloat(s.total);
+          }
         }
       }
     });
@@ -667,7 +674,7 @@ async function getDetailedSales(req, res) {
       data: results.map((r) => ({
         saleId: r.sale_id,
         date: r.created_at,
-        paymentMethod: r.payment_method === 'multiple' ? (r.mixed_payment_details || 'Mixto') : r.payment_method,
+        paymentMethod: r.mixed_payment_details ? r.mixed_payment_details : r.payment_method,
         observation: r.sale_observation,
         productName: r.product_name,
         quantity: parseFloat(r.quantity),
