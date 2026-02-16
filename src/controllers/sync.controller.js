@@ -648,10 +648,11 @@ async function syncMovement(movement) {
 
   const sql = `
     INSERT INTO movements (
-      id, type, amount, description, shift_id, is_synced, created_at
-    ) VALUES (?, ?, ?, ?, ?, 1, ?)
+      id, type, amount, payment_method, description, shift_id, is_synced, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
     ON DUPLICATE KEY UPDATE
       amount = VALUES(amount),
+      payment_method = VALUES(payment_method),
       description = VALUES(description),
       is_synced = 1,
       updated_at = CURRENT_TIMESTAMP
@@ -661,6 +662,7 @@ async function syncMovement(movement) {
     movement.id,
     movement.type,
     movement.amount,
+    movement.payment_method || 'efectivo',
     movement.description,
     movement.shift_id || null,
     new Date(movement.created_at),
@@ -672,6 +674,7 @@ async function syncMovement(movement) {
       movementId: movement.id,
       type: movement.type,
       amount: movement.amount,
+      paymentMethod: movement.payment_method || 'efectivo',
       description: movement.description,
       shiftId: movement.shift_id || null,
     });
@@ -1886,17 +1889,19 @@ async function syncCreditTransactions(req, res) {
 
         await conn.execute(
           `INSERT INTO credit_transactions (
-            id, customer_id, type, amount, remaining, sale_id,
+            id, customer_id, type, amount, payment_method, remaining, sale_id,
             shift_id, description, is_synced, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
           ON DUPLICATE KEY UPDATE
             remaining = VALUES(remaining),
+            payment_method = VALUES(payment_method),
             is_synced = 1`,
           [
             t.id,
             t.customer_id,
             t.type,
             t.amount,
+            t.payment_method || (t.type === 'payment' ? 'efectivo' : null),
             t.remaining || 0,
             t.sale_id || null,
             t.shift_id || null,

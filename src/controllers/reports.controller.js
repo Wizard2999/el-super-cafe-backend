@@ -133,6 +133,8 @@ async function getSalesSummary(req, res) {
     const abonosSummary = await query(
       `SELECT
         COUNT(*) AS total_payments,
+        COALESCE(SUM(CASE WHEN payment_method = 'efectivo' OR payment_method IS NULL THEN amount ELSE 0 END), 0) AS cash_abonos,
+        COALESCE(SUM(CASE WHEN payment_method = 'transferencia' THEN amount ELSE 0 END), 0) AS transfer_abonos,
         COALESCE(SUM(amount), 0) AS total_amount
        FROM credit_transactions
        ${abonosWhere}`,
@@ -171,10 +173,12 @@ async function getSalesSummary(req, res) {
         },
         abonos: {
           count: parseInt(abonos.total_payments),
+          cash: parseFloat(abonos.cash_abonos),
+          transfer: parseFloat(abonos.transfer_abonos),
           total: parseFloat(abonos.total_amount),
         },
         netProfit: parseFloat(sales.total_sales) - parseFloat(expenses.total_expenses),
-        cashFlow: totalCashSales + parseFloat(abonos.total_amount) - parseFloat(expenses.total_expenses),
+        cashFlow: totalCashSales + parseFloat(abonos.cash_abonos) - parseFloat(expenses.total_expenses),
       },
     });
   } catch (error) {
@@ -338,7 +342,8 @@ async function getShiftsHistory(req, res) {
           FROM sales sa 
           WHERE sa.shift_id = s.id AND sa.status = 'completed'
         ) AS cash_sales,
-        (SELECT COALESCE(SUM(ct.amount), 0) FROM credit_transactions ct WHERE ct.shift_id = s.id AND ct.type = 'payment') AS total_abonos,
+        (SELECT COALESCE(SUM(ct.amount), 0) FROM credit_transactions ct WHERE ct.shift_id = s.id AND ct.type = 'payment' AND (ct.payment_method = 'efectivo' OR ct.payment_method IS NULL)) AS cash_abonos,
+        (SELECT COALESCE(SUM(ct.amount), 0) FROM credit_transactions ct WHERE ct.shift_id = s.id AND ct.type = 'payment' AND ct.payment_method = 'transferencia') AS transfer_abonos,
         (SELECT COALESCE(SUM(m.amount), 0) FROM movements m WHERE m.shift_id = s.id AND m.type = 'gasto') AS total_expenses
        FROM shifts s
        ${statusFilter}
@@ -369,8 +374,10 @@ async function getShiftsHistory(req, res) {
         status: s.status,
         totalSales: parseFloat(s.total_sales),
         totalExpenses: parseFloat(s.total_expenses),
+        cashAbonos: parseFloat(s.cash_abonos || 0),
+        transferAbonos: parseFloat(s.transfer_abonos || 0),
         expectedCash:
-          parseFloat(s.initial_cash) + parseFloat(s.cash_sales || 0) + parseFloat(s.total_abonos || 0) - parseFloat(s.total_expenses),
+          parseFloat(s.initial_cash) + parseFloat(s.cash_sales || 0) + parseFloat(s.cash_abonos || 0) - parseFloat(s.total_expenses),
       })),
     });
   } catch (error) {
@@ -464,7 +471,13 @@ async function getShiftDetail(req, res) {
       .filter((m) => m.type === 'gasto')
       .reduce((sum, m) => sum + parseFloat(m.amount), 0);
       
-    const totalAbonos = abonos.reduce((sum, a) => sum + parseFloat(a.amount), 0);
+    const abonosCash = abonos
+      .filter(a => !a.payment_method || a.payment_method === 'efectivo')
+      .reduce((sum, a) => sum + parseFloat(a.amount), 0);
+      
+    const abonosTransfer = abonos
+      .filter(a => a.payment_method === 'transferencia')
+      .reduce((sum, a) => sum + parseFloat(a.amount), 0);
 
     res.json({
       success: true,
@@ -495,8 +508,10 @@ async function getShiftDetail(req, res) {
           salesTransfer,
           totalSales: salesCash + salesTransfer,
           totalExpenses,
-          totalAbonos,
-          expectedCash: parseFloat(shift.initial_cash) + salesCash + totalAbonos - totalExpenses,
+          abonosCash,
+          abonosTransfer,
+          totalAbonos: abonosCash + abonosTransfer,
+          expectedCash: parseFloat(shift.initial_cash) + salesCash + abonosCash - totalExpenses,
         },
         sales: sales.map((s) => ({
           id: s.id,
@@ -516,12 +531,14 @@ async function getShiftDetail(req, res) {
           id: m.id,
           type: m.type,
           amount: parseFloat(m.amount),
+          paymentMethod: m.payment_method,
           description: m.description,
           createdAt: m.created_at,
         })),
         abonos: abonos.map((a) => ({
           id: a.id,
           amount: parseFloat(a.amount),
+          paymentMethod: a.payment_method,
           customerName: a.customer_name || 'Cliente Eliminado',
           createdAt: a.created_at,
         })),
@@ -773,6 +790,7 @@ async function getExpensesDetailed(req, res) {
       data: results.map((m) => ({
         id: m.id,
         amount: parseFloat(m.amount),
+        paymentMethod: m.payment_method,
         description: m.description,
         createdAt: m.created_at,
         shiftId: m.shift_id,

@@ -116,13 +116,14 @@ function emitKitchenUpdate({ saleId, itemId, status, tableId, productName }) {
  * Emite cuando se crea un nuevo movimiento (gasto/ingreso)
  * @param {object} params
  * @param {string} params.movementId - ID del movimiento
- * @param {string} params.type - Tipo ('ingreso' | 'gasto')
+ * @param {string} params.type - Tipo ('ingreso' | 'gasto' | 'abono' | 'cobro' | 'cambio')
  * @param {number} params.amount - Monto
+ * @param {string} [params.paymentMethod] - Método de pago
  * @param {string} params.description - Descripción
  * @param {string} [params.shiftId] - ID del turno asociado
  */
-function emitMovementCreate({ movementId, type, amount, description, shiftId }) {
-  broadcast('movement:create', { movementId, type, amount, description, shiftId });
+function emitMovementCreate({ movementId, type, amount, paymentMethod, description, shiftId }) {
+  broadcast('movement:create', { movementId, type, amount, paymentMethod, description, shiftId });
 }
 
 /**

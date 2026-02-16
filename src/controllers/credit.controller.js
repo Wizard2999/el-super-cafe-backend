@@ -108,11 +108,13 @@ const updateCustomer = async (req, res) => {
 };
 
 const registerPayment = async (req, res) => {
-  const { customer_id, amount, shift_id, description } = req.body;
+  const { customer_id, amount, shift_id, description, payment_method } = req.body;
   
   if (!customer_id || !amount || amount <= 0 || !shift_id) {
     return res.status(400).json({ error: 'Invalid payment data' });
   }
+
+  const method = payment_method || 'efectivo';
 
   const connection = await pool.getConnection();
   
@@ -142,8 +144,8 @@ const registerPayment = async (req, res) => {
     // 3. Create movement (Abono)
     const movementId = uuidv4();
     await connection.query(
-      'INSERT INTO movements (id, type, amount, description, shift_id, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-      [movementId, 'abono', amount, description || `Abono cliente ${customer.name}`, shift_id]
+      'INSERT INTO movements (id, type, amount, payment_method, description, shift_id, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())',
+      [movementId, 'abono', amount, method, description || `Abono cliente ${customer.name}`, shift_id]
     );
 
     if (req.io) {
@@ -151,6 +153,7 @@ const registerPayment = async (req, res) => {
         movementId,
         type: 'abono',
         amount: parseFloat(amount),
+        paymentMethod: method,
         description: description || `Abono cliente ${customer.name}`,
         timestamp: new Date().toISOString(),
         shiftId: shift_id
@@ -177,6 +180,7 @@ const registerPayment = async (req, res) => {
         customer_id,
         type: 'payment',
         amount: paymentAmount,
+        payment_method: method,
         related_charge_id: charge.id,
         movement_id: movementId,
         shift_id,
@@ -185,8 +189,8 @@ const registerPayment = async (req, res) => {
       };
       
       await connection.query(
-        'INSERT INTO credit_transactions (id, customer_id, type, amount, related_charge_id, movement_id, shift_id, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [paymentId, customer_id, 'payment', paymentAmount, charge.id, movementId, shift_id, paymentTx.description, paymentTx.created_at]
+        'INSERT INTO credit_transactions (id, customer_id, type, amount, payment_method, related_charge_id, movement_id, shift_id, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [paymentId, customer_id, 'payment', paymentAmount, method, charge.id, movementId, shift_id, paymentTx.description, paymentTx.created_at]
       );
       
       paymentsCreated.push(paymentTx);
